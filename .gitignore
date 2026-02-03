@@ -1,0 +1,62 @@
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Logs =====
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ===== Node =====
+node_modules/
+npm-cache/
+.yarn/
+.pnpm-store/
+
+# ===== Build outputs =====
+dist/
+build/
+out/
+release/
+coverage/
+
+# ===== Env =====
+.env
+.env.*
+!.env.example
+
+# ===== Editor / IDE =====
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+
+# ===== Electron =====
+electron/dist/
+electron/out/
+*.asar
+
+# ===== Next.js / React =====
+.next/
+.vercel/
+
+# ===== Cache =====
+.cache/
+.tmp/
+
+# ===== Python (if any) =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ===== Supabase =====
+supabase/.temp/
+
+# ===== Misc =====
+*.local
+*.bak

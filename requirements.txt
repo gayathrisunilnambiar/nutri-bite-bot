@@ -11,8 +11,8 @@ requests>=2.31.0
 # Database (Optional - for SQL extraction)
 psycopg2-binary>=2.9.0
 
-# LLM Integration (Optional)
-anthropic>=0.18.0
+# LLM Integration (Mistral Vision for pantry analysis)
+mistralai>=1.0.0
 
 # Web Framework (Optional - for REST API)
 flask>=3.0.0

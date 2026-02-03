@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nutri-Bite Bot | Ingredient Quantity Recommender</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1>🥗 Nutri-Bite Bot</h1>
+            <p class="tagline">CBC-Based Ingredient Quantity Recommender</p>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Step 1: CBC Report -->
+            <section class="card" id="step1">
+                <h2><span class="step-number">1</span> Enter Your Lab Values</h2>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="egfr">eGFR <span class="unit">(mL/min/1.73m²)</span></label>
+                        <input type="number" id="egfr" placeholder="e.g., 45" step="0.1">
+                        <span class="hint">Normal: ≥90</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="creatinine">Creatinine <span class="unit">(mg/dL)</span></label>
+                        <input type="number" id="creatinine" placeholder="e.g., 1.2" step="0.1">
+                        <span class="hint">Normal: 0.7-1.3</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="potassium">Potassium (K+) <span class="unit">(mEq/L)</span></label>
+                        <input type="number" id="potassium" placeholder="e.g., 4.5" step="0.1">
+                        <span class="hint">Normal: 3.5-5.0</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="sodium">Sodium (Na+) <span class="unit">(mEq/L)</span></label>
+                        <input type="number" id="sodium" placeholder="e.g., 140" step="0.1">
+                        <span class="hint">Normal: 136-145</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="glucose">Fasting Glucose <span class="unit">(mg/dL)</span></label>
+                        <input type="number" id="glucose" placeholder="e.g., 100" step="1">
+                        <span class="hint">Normal: 70-100</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="hba1c">HbA1c <span class="unit">(%)</span></label>
+                        <input type="number" id="hba1c" placeholder="e.g., 5.5" step="0.1">
+                        <span class="hint">Normal: &lt;5.7%</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 2: Conditions -->
+            <section class="card" id="step2">
+                <h2><span class="step-number">2</span> Select Your Conditions</h2>
+                <div class="checkbox-group">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="diabetes_t1">
+                        <span class="checkmark"></span>
+                        Diabetes Type 1
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="hypertension">
+                        <span class="checkmark"></span>
+                        Hypertension (High Blood Pressure)
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="ckd">
+                        <span class="checkmark"></span>
+                        Chronic Kidney Disease (CKD)
+                    </label>
+                </div>
+            </section>
+
+            <!-- Step 3: Pantry Input -->
+            <section class="card" id="step3">
+                <h2><span class="step-number">3</span> Enter Your Ingredients</h2>
+                
+                <!-- Image Upload -->
+                <div class="upload-area" id="dropZone">
+                    <input type="file" id="imageInput" accept="image/*" hidden>
+                    <div class="upload-icon">📷</div>
+                    <p>Drag & drop a pantry image or <span class="link">click to upload</span></p>
+                    <p class="hint">Supports JPG, PNG, WebP</p>
+                </div>
+                <div id="imagePreview" class="image-preview hidden">
+                    <img id="previewImg" src="" alt="Preview">
+                    <button id="removeImage" class="btn-remove">✕</button>
+                </div>
+
+                <!-- Text Input Alternative -->
+                <div class="divider">
+                    <span>OR</span>
+                </div>
+                <div class="form-group">
+                    <label for="ingredientsText">Type ingredients (comma-separated)</label>
+                    <textarea id="ingredientsText" rows="3" placeholder="e.g., potato, apple, chicken breast, spinach, banana"></textarea>
+                </div>
+            </section>
+
+            <!-- Analyze Button -->
+            <button id="analyzeBtn" class="btn-primary">
+                <span class="btn-text">Analyze & Get Recommendations</span>
+                <span class="btn-loader hidden">Analyzing...</span>
+            </button>
+
+            <!-- Results Section -->
+            <section class="card results-card hidden" id="results">
+                <h2>📊 Analysis Results</h2>
+                
+                <!-- CBC Summary -->
+                <div class="result-section" id="cbcResults">
+                    <h3>Lab Value Analysis</h3>
+                    <div id="cbcSummary"></div>
+                    <div id="alerts"></div>
+                </div>
+
+                <!-- Daily Limits -->
+                <div class="result-section" id="limitsSection">
+                    <h3>Your Daily Nutrient Limits</h3>
+                    <div id="dailyLimits" class="limits-grid"></div>
+                </div>
+
+                <!-- Recommendations -->
+                <div class="result-section" id="recommendationsSection">
+                    <h3>Ingredient Recommendations</h3>
+                    <div id="recommendationsList"></div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>⚠️ This tool is for informational purposes only. Always consult your healthcare provider.</p>
+        </footer>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
