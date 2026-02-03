@@ -48,6 +48,7 @@ class ClinicalModelConfig:
         "sodium_sensitivity",
         "potassium_sensitivity",
         "protein_restriction",
+        "carb_sensitivity",
     )
     
     lgbm_params: Dict[str, Any] = field(default_factory=lambda: {
@@ -311,6 +312,31 @@ class LabelGenerator:
         df.loc[mask_high, 'protein_restriction'] = 2
         
         counts = df['protein_restriction'].value_counts().sort_index()
+        print(f"   Low: {counts.get(0, 0)}, Moderate: {counts.get(1, 0)}, High: {counts.get(2, 0)}")
+        
+        # 4. Carb sensitivity (diabetes-focused)
+        print("\n4. Carb Sensitivity (Diabetes Risk):")
+        df['carb_sensitivity'] = 0
+        
+        # Moderate: pre-diabetes OR diabetes OR high BMI OR elevated FBS
+        mask_moderate = (
+            (df['hba1c'] >= 5.7) |  # Pre-diabetes threshold
+            (df['fbs'] >= 100) |    # Impaired fasting glucose
+            (df['bmi'] >= 25) |     # Overweight
+            (df['has_dm'] == 1)
+        )
+        df.loc[mask_moderate, 'carb_sensitivity'] = 1
+        
+        # High: uncontrolled diabetes OR very high HbA1c OR very high FBS OR obesity
+        mask_high = (
+            (df['hba1c'] >= 7.0) |   # Diabetic range
+            (df['fbs'] >= 126) |     # Diabetic FBS threshold
+            (df['bmi'] >= 30) |      # Obesity
+            ((df['has_dm'] == 1) & (df['hba1c'] >= 6.5))
+        )
+        df.loc[mask_high, 'carb_sensitivity'] = 2
+        
+        counts = df['carb_sensitivity'].value_counts().sort_index()
         print(f"   Low: {counts.get(0, 0)}, Moderate: {counts.get(1, 0)}, High: {counts.get(2, 0)}")
         
         return df
