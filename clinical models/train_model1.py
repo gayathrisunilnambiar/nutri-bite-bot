@@ -1,6 +1,7 @@
 """
 Clinical Model #1 Training Script
 Train risk stratification model on MIMIC-IV EventLog and ActivityAttributes data.
+Includes condition-specific nutrient thresholds and accuracy analysis reports.
 """
 
 import numpy as np
@@ -10,12 +11,20 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, List, Optional
 import joblib
 import argparse
+import json
 
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    precision_score, recall_score, f1_score, cohen_kappa_score,
+)
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 # ===============================
@@ -65,7 +74,357 @@ class ClinicalModelConfig:
     })
     
     model_dir: Path = Path("../artifacts/models")
+    reports_dir: Path = Path("../artifacts/models/reports")
     data_dir: Path = Path("../mimic IV")
+
+
+# ===============================
+# Nutrient Threshold Engine
+# ===============================
+
+class NutrientThresholdEngine:
+    """
+    Determine condition-specific permissible daily nutrient amounts
+    based on KDIGO 2024, ADA Standards of Care 2024, and AHA/ACC guidelines.
+    """
+
+    # Thresholds keyed by (has_htn, has_dm, ckd_stage)
+    # ckd_stage: 0=none, 3=stage3, 4=stage4, 5=stage5/dialysis
+    THRESHOLDS = {
+        # --- No CKD ---
+        (0, 0, 0): {  # Healthy
+            "sodium_mg":      {"max": 2300, "unit": "mg/day", "rationale": "General healthy limit (AHA)"},
+            "potassium_mg":   {"min": 2600, "max": 3400, "unit": "mg/day", "rationale": "Adequate intake range"},
+            "protein_g_per_kg":{"min": 0.8,  "max": 1.0,  "unit": "g/kg/day", "rationale": "RDA for healthy adults"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "45-65% of 2000 kcal diet"},
+            "phosphorus_mg":  {"max": 1250, "unit": "mg/day", "rationale": "RDA upper range"},
+            "fluid_ml":       {"min": 2000, "max": 2500, "unit": "mL/day", "rationale": "Standard hydration"},
+        },
+        (1, 0, 0): {  # HTN only
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Strict sodium limit for HTN (AHA/ACC)"},
+            "potassium_mg":   {"min": 3500, "max": 4700, "unit": "mg/day", "rationale": "DASH diet target — higher K helps lower BP"},
+            "protein_g_per_kg":{"min": 0.8,  "max": 1.0,  "unit": "g/kg/day", "rationale": "Normal protein intake"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "Normal carb intake"},
+            "phosphorus_mg":  {"max": 1250, "unit": "mg/day", "rationale": "RDA upper range"},
+            "fluid_ml":       {"min": 2000, "max": 2500, "unit": "mL/day", "rationale": "Standard hydration"},
+        },
+        (0, 1, 0): {  # DM only
+            "sodium_mg":      {"max": 2300, "unit": "mg/day", "rationale": "Standard limit (ADA)"},
+            "potassium_mg":   {"min": 2600, "max": 3400, "unit": "mg/day", "rationale": "Adequate intake"},
+            "protein_g_per_kg":{"min": 0.8,  "max": 1.0,  "unit": "g/kg/day", "rationale": "Normal protein (ADA)"},
+            "carbs_g":        {"min": 130,  "max": 200,  "unit": "g/day", "rationale": "Reduced carbs, prefer low GI (ADA 2024)"},
+            "phosphorus_mg":  {"max": 1250, "unit": "mg/day", "rationale": "RDA upper range"},
+            "fluid_ml":       {"min": 2000, "max": 2500, "unit": "mL/day", "rationale": "Standard hydration"},
+        },
+        (1, 1, 0): {  # HTN + DM
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Strict limit for HTN+DM (AHA/ADA)"},
+            "potassium_mg":   {"min": 3500, "max": 4700, "unit": "mg/day", "rationale": "DASH diet target"},
+            "protein_g_per_kg":{"min": 0.8,  "max": 0.8,  "unit": "g/kg/day", "rationale": "Conservative protein"},
+            "carbs_g":        {"min": 130,  "max": 200,  "unit": "g/day", "rationale": "Controlled carbs (ADA)"},
+            "phosphorus_mg":  {"max": 1250, "unit": "mg/day", "rationale": "RDA"},
+            "fluid_ml":       {"min": 2000, "max": 2500, "unit": "mL/day", "rationale": "Standard hydration"},
+        },
+        # --- CKD Stage 3 (eGFR 30-59) ---
+        (0, 0, 3): {  # CKD3 only
+            "sodium_mg":      {"max": 2000, "unit": "mg/day", "rationale": "KDIGO CKD stage 3 guideline"},
+            "potassium_mg":   {"max": 2000, "unit": "mg/day", "rationale": "Restricted — reduced renal clearance (KDIGO)"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.8,  "unit": "g/kg/day", "rationale": "Low-protein diet to slow progression (KDIGO)"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "Normal carbs"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Phosphorus restricted in CKD (KDIGO)"},
+            "fluid_ml":       {"min": 1500, "max": 2000, "unit": "mL/day", "rationale": "Per physician guidance"},
+        },
+        (1, 0, 3): {  # HTN + CKD3
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Strict for HTN+CKD (KDIGO/AHA)"},
+            "potassium_mg":   {"max": 2000, "unit": "mg/day", "rationale": "Restricted for CKD3"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.8,  "unit": "g/kg/day", "rationale": "Low protein (KDIGO)"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "Normal"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Phosphorus restricted"},
+            "fluid_ml":       {"min": 1000, "max": 1500, "unit": "mL/day", "rationale": "Monitor fluid balance"},
+        },
+        (0, 1, 3): {  # DM + CKD3
+            "sodium_mg":      {"max": 2000, "unit": "mg/day", "rationale": "KDIGO guideline for DKD"},
+            "potassium_mg":   {"max": 2000, "unit": "mg/day", "rationale": "Restricted for CKD3"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.8,  "unit": "g/kg/day", "rationale": "Low protein for DKD (KDIGO/ADA)"},
+            "carbs_g":        {"min": 130,  "max": 200,  "unit": "g/day", "rationale": "Controlled carbs (ADA)"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 1000, "max": 1500, "unit": "mL/day", "rationale": "Monitor fluid"},
+        },
+        (1, 1, 3): {  # HTN + DM + CKD3
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Most restrictive sodium (KDIGO/AHA/ADA)"},
+            "potassium_mg":   {"max": 2000, "unit": "mg/day", "rationale": "CKD restricted"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.8,  "unit": "g/kg/day", "rationale": "Low protein"},
+            "carbs_g":        {"min": 130,  "max": 200,  "unit": "g/day", "rationale": "Controlled carbs"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 1000, "max": 1500, "unit": "mL/day", "rationale": "Fluid restricted"},
+        },
+        # --- CKD Stage 4 (eGFR 15-29) ---
+        (0, 0, 4): {  # CKD4 only
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "KDIGO CKD stage 4"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted (KDIGO)"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.6,  "unit": "g/kg/day", "rationale": "Very low protein (KDIGO)"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "Normal carbs"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 1000, "max": 1500, "unit": "mL/day", "rationale": "Fluid restricted"},
+        },
+        (1, 0, 4): {  # HTN + CKD4
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Strict (KDIGO/AHA)"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.6,  "unit": "g/kg/day", "rationale": "Very low protein"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "Normal"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 1000, "max": 1500, "unit": "mL/day", "rationale": "Restricted"},
+        },
+        (0, 1, 4): {  # DM + CKD4
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "DKD stage 4"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.6,  "unit": "g/kg/day", "rationale": "Very low protein"},
+            "carbs_g":        {"min": 130,  "max": 200,  "unit": "g/day", "rationale": "Controlled carbs"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 1000, "max": 1500, "unit": "mL/day", "rationale": "Restricted"},
+        },
+        (1, 1, 4): {  # HTN + DM + CKD4
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Most restrictive (KDIGO/AHA/ADA)"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted"},
+            "protein_g_per_kg":{"min": 0.6,  "max": 0.6,  "unit": "g/kg/day", "rationale": "Very low protein"},
+            "carbs_g":        {"min": 130,  "max": 180,  "unit": "g/day", "rationale": "Strictly controlled carbs"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 1000, "max": 1500, "unit": "mL/day", "rationale": "Restricted"},
+        },
+        # --- CKD Stage 5 / Dialysis (eGFR <15) ---
+        (0, 0, 5): {  # CKD5/dialysis
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "KDIGO dialysis guideline"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted (KDIGO)"},
+            "protein_g_per_kg":{"min": 1.0,  "max": 1.2,  "unit": "g/kg/day", "rationale": "Higher protein on dialysis (KDIGO)"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "Adequate energy intake"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 500,  "max": 1000, "unit": "mL/day", "rationale": "Very restricted on dialysis"},
+        },
+        (1, 0, 5): {  # HTN + CKD5
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Dialysis guideline"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted"},
+            "protein_g_per_kg":{"min": 1.0,  "max": 1.2,  "unit": "g/kg/day", "rationale": "Higher on dialysis"},
+            "carbs_g":        {"min": 225,  "max": 325,  "unit": "g/day", "rationale": "Normal"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 500,  "max": 1000, "unit": "mL/day", "rationale": "Very restricted"},
+        },
+        (0, 1, 5): {  # DM + CKD5
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "DKD dialysis"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted"},
+            "protein_g_per_kg":{"min": 1.0,  "max": 1.2,  "unit": "g/kg/day", "rationale": "Higher on dialysis"},
+            "carbs_g":        {"min": 130,  "max": 200,  "unit": "g/day", "rationale": "Controlled carbs"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 500,  "max": 1000, "unit": "mL/day", "rationale": "Very restricted"},
+        },
+        (1, 1, 5): {  # HTN + DM + CKD5
+            "sodium_mg":      {"max": 1500, "unit": "mg/day", "rationale": "Most restrictive (KDIGO/AHA/ADA)"},
+            "potassium_mg":   {"max": 1500, "unit": "mg/day", "rationale": "Severely restricted"},
+            "protein_g_per_kg":{"min": 1.0,  "max": 1.2,  "unit": "g/kg/day", "rationale": "Higher on dialysis"},
+            "carbs_g":        {"min": 130,  "max": 180,  "unit": "g/day", "rationale": "Strictly controlled"},
+            "phosphorus_mg":  {"max": 800,  "unit": "mg/day", "rationale": "Restricted"},
+            "fluid_ml":       {"min": 500,  "max": 1000, "unit": "mL/day", "rationale": "Very restricted"},
+        },
+    }
+
+    @staticmethod
+    def get_ckd_stage(egfr: float, has_ckd: int) -> int:
+        """Determine CKD stage from eGFR value."""
+        if has_ckd == 0 and egfr >= 60:
+            return 0
+        if egfr < 15:
+            return 5
+        if egfr < 30:
+            return 4
+        if egfr < 60:
+            return 3
+        return 0
+
+    def get_permissible_amounts(self, clinical_input: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Return condition-specific permissible daily nutrient amounts.
+
+        Parameters
+        ----------
+        clinical_input : dict
+            Must contain: has_htn, has_dm, has_ckd, egfr
+
+        Returns
+        -------
+        dict with keys: condition_profile, ckd_stage, nutrients (each with min/max/unit/rationale)
+        """
+        has_htn = int(clinical_input.get("has_htn", 0))
+        has_dm  = int(clinical_input.get("has_dm", 0))
+        has_ckd = int(clinical_input.get("has_ckd", 0))
+        egfr    = float(clinical_input.get("egfr", 90))
+
+        ckd_stage = self.get_ckd_stage(egfr, has_ckd)
+
+        # Build condition label
+        conditions = []
+        if has_htn: conditions.append("HTN")
+        if has_dm:  conditions.append("DM")
+        if ckd_stage > 0: conditions.append(f"CKD Stage {ckd_stage}")
+        condition_label = " + ".join(conditions) if conditions else "Healthy"
+
+        # Lookup key — use ckd_stage or 0
+        key = (has_htn, has_dm, ckd_stage)
+        thresholds = self.THRESHOLDS.get(key)
+
+        if thresholds is None:
+            # Fallback: try with just CKD if combo not found
+            key = (0, 0, ckd_stage)
+            thresholds = self.THRESHOLDS.get(key, self.THRESHOLDS[(0, 0, 0)])
+
+        return {
+            "condition_profile": condition_label,
+            "ckd_stage": ckd_stage,
+            "nutrients": thresholds,
+        }
+
+    def save_reference(self, path: Path):
+        """Save thresholds as a JSON reference file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        serializable = {}
+        for key, val in self.THRESHOLDS.items():
+            str_key = f"htn={key[0]}_dm={key[1]}_ckd={key[2]}"
+            serializable[str_key] = val
+        with open(path, "w") as f:
+            json.dump(serializable, f, indent=2)
+        print(f"  ✓ Saved nutrient thresholds reference: {path}")
+
+
+# ===============================
+# Model Evaluator
+# ===============================
+
+class ModelEvaluator:
+    """Generate comprehensive accuracy analysis reports."""
+
+    CLASS_NAMES = ['Low', 'Moderate', 'High']
+
+    def __init__(self, reports_dir: Path):
+        self.reports_dir = reports_dir
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+
+    def evaluate_all(
+        self,
+        targets: List[str],
+        y_true: pd.DataFrame,
+        y_pred: Dict[str, np.ndarray],
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Run full evaluation suite for every target.
+        Returns a dict of target -> metric_name -> value.
+        """
+        print("\n" + "="*80)
+        print("MODEL ACCURACY ANALYSIS")
+        print("="*80)
+
+        all_metrics = {}
+        rows_for_csv = []
+
+        for target in targets:
+            yt = y_true[target].values
+            yp = y_pred[target]
+
+            metrics = self._compute_metrics(yt, yp)
+            all_metrics[target] = metrics
+
+            # Confusion matrix heatmap
+            self._save_confusion_matrix(yt, yp, target)
+
+            # Collect rows for CSV
+            rows_for_csv.append({
+                "target": target,
+                **metrics,
+            })
+
+            # Print per-target summary
+            print(f"\n--- {target} ---")
+            print(f"  Accuracy:        {metrics['accuracy']:.4f}")
+            print(f"  Precision (wt):  {metrics['precision_weighted']:.4f}")
+            print(f"  Recall (wt):     {metrics['recall_weighted']:.4f}")
+            print(f"  F1-score (wt):   {metrics['f1_weighted']:.4f}")
+            print(f"  Cohen's Kappa:   {metrics['cohen_kappa']:.4f}")
+
+            # Also print the sklearn classification report
+            print(classification_report(
+                yt, yp,
+                target_names=self.CLASS_NAMES,
+                zero_division=0,
+            ))
+
+        # Save CSV
+        csv_path = self.reports_dir / "classification_reports.csv"
+        pd.DataFrame(rows_for_csv).to_csv(csv_path, index=False)
+        print(f"\n  ✓ Saved classification metrics CSV: {csv_path}")
+
+        # Save text summary
+        self._save_accuracy_summary(all_metrics)
+
+        return all_metrics
+
+    # ---- private helpers ----
+
+    def _compute_metrics(self, y_true, y_pred) -> Dict[str, float]:
+        return {
+            "accuracy":           accuracy_score(y_true, y_pred),
+            "precision_macro":    precision_score(y_true, y_pred, average='macro', zero_division=0),
+            "precision_weighted":  precision_score(y_true, y_pred, average='weighted', zero_division=0),
+            "recall_macro":       recall_score(y_true, y_pred, average='macro', zero_division=0),
+            "recall_weighted":    recall_score(y_true, y_pred, average='weighted', zero_division=0),
+            "f1_macro":           f1_score(y_true, y_pred, average='macro', zero_division=0),
+            "f1_weighted":        f1_score(y_true, y_pred, average='weighted', zero_division=0),
+            "cohen_kappa":        cohen_kappa_score(y_true, y_pred),
+        }
+
+    def _save_confusion_matrix(self, y_true, y_pred, target: str):
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
+        fig, ax = plt.subplots(figsize=(7, 5.5))
+        sns.heatmap(
+            cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=self.CLASS_NAMES,
+            yticklabels=self.CLASS_NAMES,
+            ax=ax,
+        )
+        ax.set_xlabel('Predicted', fontsize=12)
+        ax.set_ylabel('Actual', fontsize=12)
+        ax.set_title(f'Confusion Matrix — {target}', fontsize=14)
+        fig.tight_layout()
+        path = self.reports_dir / f"confusion_matrix_{target}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"  ✓ Saved confusion matrix: {path}")
+
+    def _save_accuracy_summary(self, all_metrics: Dict[str, Dict[str, float]]):
+        path = self.reports_dir / "accuracy_summary.txt"
+        lines = [
+            "=" * 70,
+            "CLINICAL MODEL #1 — ACCURACY ANALYSIS SUMMARY",
+            "=" * 70,
+            "",
+        ]
+        for target, metrics in all_metrics.items():
+            lines.append(f"Target: {target}")
+            lines.append("-" * 40)
+            for k, v in metrics.items():
+                lines.append(f"  {k:25s} : {v:.4f}")
+            lines.append("")
+
+        # Overall average
+        lines.append("=" * 70)
+        lines.append("OVERALL (macro-averaged across targets)")
+        lines.append("=" * 70)
+        avg_acc = np.mean([m['accuracy'] for m in all_metrics.values()])
+        avg_f1  = np.mean([m['f1_weighted'] for m in all_metrics.values()])
+        avg_kappa = np.mean([m['cohen_kappa'] for m in all_metrics.values()])
+        lines.append(f"  Mean Accuracy:     {avg_acc:.4f}")
+        lines.append(f"  Mean F1 (wt):      {avg_f1:.4f}")
+        lines.append(f"  Mean Cohen Kappa:  {avg_kappa:.4f}")
+        lines.append("")
+
+        with open(path, "w") as f:
+            f.write("\n".join(lines))
+        print(f"  ✓ Saved accuracy summary: {path}")
 
 
 # ===============================
@@ -415,7 +774,8 @@ class ClinicalRiskStratifier:
         
         print(f"\nTrain size: {len(X_train)}, Test size: {len(X_test)}")
         
-        # Train model for each target
+        # Train model for each target and collect predictions
+        y_predictions = {}
         for target in self.cfg.targets:
             print(f"\n--- Training: {target} ---")
             
@@ -424,29 +784,43 @@ class ClinicalRiskStratifier:
             model.fit(X_train, y_train[target])
             
             self.models[target] = model
-            
-            # Evaluate
-            preds = model.predict(X_test)
-            print(classification_report(
-                y_test[target], preds,
-                target_names=['Low', 'Moderate', 'High'],
-                zero_division=0
-            ))
+            y_predictions[target] = model.predict(X_test)
         
         # Store feature names for prediction
         self.feature_names = available_cols
         
-    def predict(self, clinical_input: Dict[str, Any]) -> Dict[str, str]:
-        """Get risk predictions for a patient"""
+        # Run accuracy analysis reports
+        evaluator = ModelEvaluator(self.cfg.reports_dir)
+        self.eval_metrics = evaluator.evaluate_all(
+            list(self.cfg.targets), y_test, y_predictions,
+        )
+        
+        # Save nutrient thresholds reference
+        threshold_engine = NutrientThresholdEngine()
+        threshold_engine.save_reference(
+            self.cfg.reports_dir / "nutrient_thresholds_reference.json"
+        )
+        
+    def predict(self, clinical_input: Dict[str, Any]) -> Dict[str, Any]:
+        """Get risk predictions AND permissible nutrient amounts for a patient."""
         X = pd.DataFrame([clinical_input])[self.feature_names]
         X = self.imputer.transform(X)
         X = self.scaler.transform(X)
         
         label_map = {0: "low", 1: "moderate", 2: "high"}
         
-        return {
+        risk_levels = {
             target: label_map[int(model.predict(X)[0])]
             for target, model in self.models.items()
+        }
+        
+        # Get condition-specific permissible nutrient amounts
+        threshold_engine = NutrientThresholdEngine()
+        permissible = threshold_engine.get_permissible_amounts(clinical_input)
+        
+        return {
+            "risk_levels": risk_levels,
+            "permissible_amounts": permissible,
         }
     
     def save(self):
@@ -529,13 +903,44 @@ def main(sample_rows: int = 100000):
     }
     
     predictions = model.predict(test_patient)
-    print(f"\nTest patient predictions:")
-    for target, risk in predictions.items():
-        print(f"  {target}: {risk}")
     
+    print(f"\nTest patient: HTN + DM + CKD (eGFR=28)")
+    print(f"\n  Risk Levels:")
+    for target, risk in predictions["risk_levels"].items():
+        print(f"    {target}: {risk}")
+    
+    pa = predictions["permissible_amounts"]
+    print(f"\n  Condition Profile: {pa['condition_profile']}")
+    print(f"  CKD Stage: {pa['ckd_stage']}")
+    print(f"\n  Permissible Daily Nutrient Amounts:")
+    print(f"  {'Nutrient':<22} {'Limit':<20} {'Rationale'}")
+    print(f"  {'-'*70}")
+    for nutrient, info in pa["nutrients"].items():
+        lo = info.get('min', '')
+        hi = info.get('max', '')
+        unit = info['unit']
+        if lo and hi:
+            limit_str = f"{lo}–{hi} {unit}"
+        elif hi:
+            limit_str = f"≤{hi} {unit}"
+        else:
+            limit_str = f"≥{lo} {unit}"
+        print(f"    {nutrient:<20} {limit_str:<20} {info['rationale']}")
+    
+    # 7. Final summary
     print("\n" + "="*80)
     print("✓ TRAINING COMPLETE")
     print("="*80)
+    print(f"\n  Reports saved to: {config.reports_dir.resolve()}")
+    print(f"  Models saved to:  {config.model_dir.resolve()}")
+    
+    if hasattr(model, 'eval_metrics'):
+        print(f"\n  {'Target':<30} {'Accuracy':>10} {'F1 (wt)':>10} {'Kappa':>10}")
+        print(f"  {'-'*62}")
+        for t, m in model.eval_metrics.items():
+            print(f"  {t:<30} {m['accuracy']:>10.4f} {m['f1_weighted']:>10.4f} {m['cohen_kappa']:>10.4f}")
+    
+    print()
 
 
 if __name__ == "__main__":
