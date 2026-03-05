@@ -56,8 +56,11 @@ class OutputFormatter:
             text = text[:content_width-3] + "..."
         return f"{self.BOX_V}{' ' * (padding + 1)}{text.ljust(content_width + padding + 1)}{self.BOX_V}"
     
-    def _risk_badge(self, risk: str) -> str:
+    def _risk_badge(self, risk) -> str:
         """Create a risk level badge"""
+        # Handle enriched dict format: {"label": "high", "severity_score": ...}
+        if isinstance(risk, dict):
+            risk = risk.get("label", "moderate")
         risk = risk.lower()
         if risk == "low":
             return f"{self.ICON_HEART} LOW"
