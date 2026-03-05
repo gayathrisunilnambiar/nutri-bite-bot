@@ -17,13 +17,18 @@ Dependencies:
 import pandas as pd
 import numpy as np
 import joblib
+import math
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union
 from difflib import get_close_matches
 import warnings
 
 warnings.filterwarnings('ignore')
+
+# Import MonotonicFeatureTransformer so joblib can deserialize
+# monotonic_transformer.joblib (class must be in namespace at load time)
+from train_model1 import MonotonicFeatureTransformer  # noqa: F401
 
 
 # ===============================
@@ -91,13 +96,6 @@ class Model2Config:
             "carbs_g": 150,
             "phosphorus_mg": 800,   # CKD phosphorus restriction
         },
-    })
-    
-    # Risk level fractions - what % of daily budget can ONE ingredient use
-    risk_fractions: Dict[str, float] = field(default_factory=lambda: {
-        "low": 0.40,      # 40% of remaining budget
-        "moderate": 0.25, # 25% of remaining budget
-        "high": 0.10,     # 10% of remaining budget (very restricted)
     })
     
     # Portion thresholds
@@ -217,13 +215,177 @@ class PortionDecision:
 
 
 # ===============================
+# Nutrient Ledger
+# ===============================
+class NutrientLedger:
+    """
+    Stateful daily nutrient intake tracker.
+
+    Clinical rationale:
+    A CKD patient with a 2000 mg/day sodium limit who eats 900 mg at breakfast
+    must have their lunch and dinner budgets reduced to 1100 mg total. Without
+    a persistent ledger, every get_recommendations() call treats the patient as
+    if they have consumed nothing — this class closes that gap.
+
+    The ledger accumulates nutrient loads from confirmed meals and subtracts
+    them from the base daily budget on every subsequent recommendation request.
+    It auto-resets if the session crosses midnight.
+    """
+
+    TRACKED_NUTRIENTS = [
+        "sodium_mg", "potassium_mg", "protein_g",
+        "carbs_g", "phosphorus_mg", "calories",
+    ]
+
+    def __init__(self):
+        """Initialize an empty ledger for today's session."""
+        self._reset()
+
+    def _reset(self):
+        """Zero all accumulators and clear meal history."""
+        from datetime import date
+        self._session_date = date.today()
+        self._consumed: Dict[str, float] = {n: 0.0 for n in self.TRACKED_NUTRIENTS}
+        self._meals: List[Dict[str, Any]] = []
+
+    def _check_midnight(self):
+        """
+        Auto-reset if the current date differs from the session start date.
+
+        Clinical rationale:
+        Daily nutrient budgets are 24-hour allowances. If a user's session
+        spans midnight, continuing to accumulate yesterday's intake into
+        today's budget would be clinically incorrect.
+        """
+        from datetime import date
+        if date.today() != self._session_date:
+            print("\u26a0 NutrientLedger: midnight crossed \u2014 resetting daily totals")
+            self._reset()
+
+    def log_accepted_portions(
+        self,
+        meal_name: str,
+        portions: List[PortionDecision],
+        ifct: "IFCTDatabase",
+    ) -> Dict[str, float]:
+        """
+        Record the nutrient content of every non-Avoid portion.
+
+        Clinical rationale:
+        Only portions the patient actually intends to eat (Allowed or Half
+        portion) should count toward consumption. Avoided items are not
+        eaten and must not deplete the budget.
+
+        Parameters
+        ----------
+        meal_name : str
+            Human-readable label (e.g. 'Breakfast', 'Lunch').
+        portions : list of PortionDecision
+            The recommendations the user has confirmed.
+        ifct : IFCTDatabase
+            Used to look up per-100g nutrient values for calorie tracking.
+
+        Returns
+        -------
+        dict : nutrients added by this meal
+        """
+        self._check_midnight()
+
+        meal_nutrients: Dict[str, float] = {n: 0.0 for n in self.TRACKED_NUTRIENTS}
+        accepted_items: List[str] = []
+
+        for p in portions:
+            if p.label == "Avoid":
+                continue
+
+            factor = p.max_grams / 100.0
+
+            # Use pre-computed nutrient_load_at_max for the four main nutrients
+            meal_nutrients["sodium_mg"] += p.nutrient_load_at_max.get("sodium_mg", 0)
+            meal_nutrients["potassium_mg"] += p.nutrient_load_at_max.get("potassium_mg", 0)
+            meal_nutrients["protein_g"] += p.nutrient_load_at_max.get("protein_g", 0)
+            meal_nutrients["carbs_g"] += p.nutrient_load_at_max.get("carbs_g", 0)
+
+            # Look up phosphorus and calories from IFCT (not in nutrient_load_at_max)
+            try:
+                full_nutrients = ifct.get_nutrients_per_100g(p.ingredient)
+                meal_nutrients["phosphorus_mg"] += full_nutrients.get("phosphorus_mg", 0) * factor
+                meal_nutrients["calories"] += full_nutrients.get("calories", 0) * factor
+            except KeyError:
+                pass  # ingredient not in DB — skip extras
+
+            accepted_items.append(p.ingredient)
+
+        # Accumulate into daily totals
+        for k in self.TRACKED_NUTRIENTS:
+            self._consumed[k] += meal_nutrients[k]
+
+        # Record meal in history
+        self._meals.append({
+            "meal_name": meal_name,
+            "items": accepted_items,
+            "nutrients": {k: round(v, 1) for k, v in meal_nutrients.items()},
+        })
+
+        return {k: round(v, 1) for k, v in meal_nutrients.items()}
+
+    def get_remaining_budget(self, base_budget: DailyBudget) -> DailyBudget:
+        """
+        Subtract consumed totals from the base daily budget.
+
+        Clinical rationale:
+        Each subsequent meal recommendation must reflect what the patient
+        has already eaten. A CKD patient on a 2000 mg potassium limit
+        who consumed 1200 mg at breakfast should only see 800 mg of
+        potassium headroom for subsequent meals.
+
+        Parameters
+        ----------
+        base_budget : DailyBudget
+            The full-day allowance before any consumption.
+
+        Returns
+        -------
+        DailyBudget : remaining allowance, all fields floored at 0.
+        """
+        self._check_midnight()
+        return DailyBudget(
+            sodium_mg_remaining=max(0.0, base_budget.sodium_mg_remaining - self._consumed["sodium_mg"]),
+            potassium_mg_remaining=max(0.0, base_budget.potassium_mg_remaining - self._consumed["potassium_mg"]),
+            protein_g_remaining=max(0.0, base_budget.protein_g_remaining - self._consumed["protein_g"]),
+            carbs_g_remaining=max(0.0, base_budget.carbs_g_remaining - self._consumed["carbs_g"]),
+            phosphorus_mg_remaining=max(0.0, base_budget.phosphorus_mg_remaining - self._consumed["phosphorus_mg"]),
+        )
+
+    def daily_summary(self) -> Dict[str, Any]:
+        """
+        Return consumed totals and meal history for the current session.
+
+        Clinical rationale:
+        Gives clinicians and patients a running view of daily intake against
+        limits, enabling informed dietary decisions for remaining meals.
+
+        Returns
+        -------
+        dict with keys: consumed_totals, meals, meal_count
+        """
+        self._check_midnight()
+        return {
+            "consumed_totals": {k: round(v, 1) for k, v in self._consumed.items()},
+            "meals": list(self._meals),
+            "meal_count": len(self._meals),
+        }
+
+
+# ===============================
 # Model1 Integration
 # ===============================
 class Model1Integration:
     """
-    Load and use Model1's trained clinical risk models.
+    Load and use Model1's trained NGBoost clinical risk models.
     Predicts: sodium_sensitivity, potassium_sensitivity, 
               protein_restriction, carb_sensitivity
+    Each prediction returns a dict with label, severity_score, confidence, proba.
     """
     
     def __init__(self, model_dir: Path):
@@ -232,11 +394,12 @@ class Model1Integration:
         self.imputer = None
         self.scaler = None
         self.feature_names = None
+        self.mono_transformer = None
         
         self._load_models()
     
     def _load_models(self):
-        """Load all Model1 components"""
+        """Load all Model1 components including monotonic transformer."""
         try:
             self.models = {
                 "sodium_sensitivity": joblib.load(self.model_dir / "sodium_sensitivity.joblib"),
@@ -248,50 +411,127 @@ class Model1Integration:
             self.scaler = joblib.load(self.model_dir / "scaler.joblib")
             self.feature_names = joblib.load(self.model_dir / "feature_names.joblib")
             
+            # Load monotonic transformer (graceful fallback for older artifacts)
+            mono_path = self.model_dir / "monotonic_transformer.joblib"
+            if mono_path.exists():
+                self.mono_transformer = joblib.load(mono_path)
+                print(f"✓ Loaded MonotonicFeatureTransformer from {mono_path}")
+            else:
+                self.mono_transformer = None
+                print("⚠ No monotonic_transformer.joblib found — skipping")
+            
             print(f"✓ Loaded Model1 components from {self.model_dir}")
         except Exception as e:
             raise RuntimeError(f"Failed to load Model1: {e}")
     
-    def predict_risk_levels(self, patient_data: Dict[str, Any]) -> Dict[str, str]:
+    @staticmethod
+    def get_risk_label(risk_entry: Union[dict, str]) -> str:
+        """
+        Extract the plain label string from a risk_levels entry.
+
+        Clinical rationale:
+        Backward-compatibility helper so that any downstream code expecting
+        a plain string (e.g. 'high') can still work with the new enriched
+        dict structure {label, severity_score, confidence, proba}.
+
+        Parameters
+        ----------
+        risk_entry : dict or str
+            Either the new enriched dict or a legacy plain string.
+
+        Returns
+        -------
+        str : 'low', 'moderate', or 'high'
+        """
+        if isinstance(risk_entry, dict):
+            return risk_entry["label"]
+        return str(risk_entry)
+    
+    def predict_risk_levels(self, patient_data: Dict[str, Any]) -> Dict[str, dict]:
         """
         Predict clinical risk levels from patient data.
+
+        Clinical rationale:
+        Returns enriched dicts instead of plain strings so that downstream
+        PortionRecommender can use the continuous severity_score (probability-
+        weighted class index ∈ [0.0, 2.0]) for sigmoid-based fraction mapping,
+        eliminating the dose-cliff at label boundaries.
         
         Args:
             patient_data: Dict with keys like age, sex_male, has_htn, has_dm, 
                          has_ckd, serum_sodium, serum_potassium, etc.
         
         Returns:
-            Dict with risk levels: {
-                "sodium_sensitivity": "low/moderate/high",
-                "potassium_sensitivity": "low/moderate/high",
-                "protein_restriction": "low/moderate/high",
-                "carb_sensitivity": "low/moderate/high",
-                "phosphorus_sensitivity": "low/moderate/high"
+            Dict with enriched risk levels: {
+                "sodium_sensitivity": {
+                    "label": "high",
+                    "severity_score": 1.85,
+                    "confidence": 0.78,
+                    "proba": {"low": 0.05, "moderate": 0.17, "high": 0.78}
+                },
+                ...
+                "phosphorus_sensitivity": { ... }  # rule-derived
             }
         """
         # Prepare features
         X = pd.DataFrame([patient_data])[self.feature_names]
         X = self.imputer.transform(X)
         X = self.scaler.transform(X)
+        if self.mono_transformer is not None:
+            X = self.mono_transformer.transform(X)
         
         label_map = {0: "low", 1: "moderate", 2: "high"}
+        class_indices = np.array([0, 1, 2], dtype=float)
         
-        results = {
-            target: label_map[int(model.predict(X)[0])]
-            for target, model in self.models.items()
-        }
+        results = {}
+        for target, model in self.models.items():
+            pred_label = int(model.predict(X)[0])
+            # Extract probability distribution from NGBoost
+            dist_params = model.pred_dist(X).params
+            probas = np.array([dist_params[f'p{i}'][0] for i in range(3)])
+            probas = probas / probas.sum()  # numerical safety
+            
+            severity_score = float(np.dot(probas, class_indices))
+            confidence = float(probas.max())
+            
+            results[target] = {
+                "label": label_map[pred_label],
+                "severity_score": round(severity_score, 4),
+                "confidence": round(confidence, 4),
+                "proba": {
+                    "low": round(float(probas[0]), 4),
+                    "moderate": round(float(probas[1]), 4),
+                    "high": round(float(probas[2]), 4),
+                },
+            }
         
         # Add phosphorus sensitivity based on CKD status (kidney.org.uk guideline)
-        # Phosphate additives are harmful for CKD patients - restrict phosphorus
+        # Phosphate additives are harmful for CKD patients — restrict phosphorus
+        # Rule-derived with hard-coded severity tiers matching eGFR-based staging
         has_ckd = patient_data.get("has_ckd", 0) == 1
         egfr = patient_data.get("egfr", 90)
         
         if has_ckd or egfr < 30:
-            results["phosphorus_sensitivity"] = "high"
+            results["phosphorus_sensitivity"] = {
+                "label": "high",
+                "severity_score": 1.8,
+                "confidence": 0.90,
+                "proba": {"low": 0.05, "moderate": 0.05, "high": 0.90},
+            }
         elif egfr < 60:
-            results["phosphorus_sensitivity"] = "moderate"
+            results["phosphorus_sensitivity"] = {
+                "label": "moderate",
+                "severity_score": 1.0,
+                "confidence": 0.75,
+                "proba": {"low": 0.10, "moderate": 0.75, "high": 0.15},
+            }
         else:
-            results["phosphorus_sensitivity"] = "low"
+            results["phosphorus_sensitivity"] = {
+                "label": "low",
+                "severity_score": 0.2,
+                "confidence": 0.85,
+                "proba": {"low": 0.85, "moderate": 0.10, "high": 0.05},
+            }
         
         return results
 
@@ -303,7 +543,15 @@ class PortionRecommender:
     """
     Deterministic portion recommendation engine.
     Uses IFCT nutritional data + Model1 risk levels to recommend safe portions.
+    Now uses continuous severity_score via a sigmoid mapping to compute
+    per-nutrient fractions, eliminating dose-cliffs at label boundaries.
     """
+    
+    # Sigmoid parameters tuned so f(0.0) ≈ 0.40, f(2.0) ≈ 0.08
+    _SIGMOID_L = 0.42   # upper asymptote
+    _SIGMOID_K = 1.60   # steepness
+    _SIGMOID_S0 = 1.0   # midpoint
+    _SIGMOID_FLOOR = 0.05  # minimum fraction (never reach zero)
     
     def __init__(
         self,
@@ -312,6 +560,61 @@ class PortionRecommender:
     ):
         self.ifct = ifct
         self.config = config
+    
+    def severity_to_fraction(self, severity_score: float) -> float:
+        """
+        Map a continuous severity_score ∈ [0.0, 2.0] to a budget fraction.
+
+        Clinical rationale:
+        A sigmoid curve prevents dose-cliffs at label boundaries. Two patients
+        with the same discrete label (e.g. 'high') but different eGFR values
+        will have different severity_scores, producing meaningfully different
+        portion sizes. The curve is anchored at:
+          severity=0.0 → ~0.40 (generous, low-risk)
+          severity=1.0 → ~0.24 (moderate — close to old 0.25)
+          severity=2.0 → ~0.08 (restrictive, high-risk)
+
+        Parameters
+        ----------
+        severity_score : float
+            Probability-weighted class index from NGBoost, ∈ [0.0, 2.0].
+
+        Returns
+        -------
+        float : budget fraction ∈ [_SIGMOID_FLOOR, _SIGMOID_L]
+        """
+        fraction = self._SIGMOID_L / (
+            1.0 + math.exp(self._SIGMOID_K * (severity_score - self._SIGMOID_S0))
+        )
+        return max(self._SIGMOID_FLOOR, fraction)
+    
+    @staticmethod
+    def _extract_severity(entry: Union[dict, str], default: float = 1.0) -> float:
+        """
+        Extract severity_score from a risk_levels entry.
+
+        Clinical rationale:
+        Graceful fallback: if Model1Integration returns the new enriched dict,
+        use its severity_score. If it somehow returns a legacy plain string,
+        map to a safe default of 1.0 (moderate). This ensures the system
+        never crashes on mixed-version artifacts.
+
+        Parameters
+        ----------
+        entry : dict or str
+            Either {label, severity_score, confidence, proba} or 'low'/'moderate'/'high'.
+        default : float
+            Fallback severity_score if entry is a plain string.
+
+        Returns
+        -------
+        float : severity_score ∈ [0.0, 2.0]
+        """
+        if isinstance(entry, dict):
+            return float(entry.get("severity_score", default))
+        # Legacy plain string fallback
+        _legacy_map = {"low": 0.2, "moderate": 1.0, "high": 1.8}
+        return _legacy_map.get(str(entry).lower().strip(), default)
     
     @staticmethod
     def _grams_from_budget(
@@ -335,15 +638,22 @@ class PortionRecommender:
     def recommend_one(
         self,
         ingredient: str,
-        risk_levels: Dict[str, str],
+        risk_levels: Dict[str, Union[dict, str]],
         budget: DailyBudget
     ) -> PortionDecision:
         """
         Recommend portion for a single ingredient.
+
+        Clinical rationale:
+        For each nutrient, extract the severity_score from the enriched
+        risk_levels dict and convert it to a continuous budget fraction
+        via the sigmoid mapping. This means two patients with the same
+        label but different underlying eGFR (or HbA1c, etc.) will receive
+        meaningfully different portion sizes.
         
         Args:
             ingredient: Name of ingredient (must be in IFCT)
-            risk_levels: Output from Model1 (sodium_sensitivity, etc.)
+            risk_levels: Output from Model1 (enriched dicts or legacy strings)
             budget: Remaining daily nutrient budget
         
         Returns:
@@ -365,27 +675,26 @@ class PortionRecommender:
                 binding_constraint="unknown"
             )
         
-        # Get risk levels with defaults
-        def norm_risk(r: str) -> str:
-            r = (r or "moderate").lower().strip()
-            return r if r in self.config.risk_fractions else "moderate"
+        # Extract severity scores from enriched risk_levels
+        sod_sev = self._extract_severity(risk_levels.get("sodium_sensitivity", {}), default=1.0)
+        pot_sev = self._extract_severity(risk_levels.get("potassium_sensitivity", {}), default=1.0)
+        pro_sev = self._extract_severity(risk_levels.get("protein_restriction", {}), default=1.0)
+        carb_sev = self._extract_severity(risk_levels.get("carb_sensitivity", {}), default=1.0)
+        phos_sev = self._extract_severity(risk_levels.get("phosphorus_sensitivity", {}), default=0.2)
         
-        sod_risk = norm_risk(risk_levels.get("sodium_sensitivity", "moderate"))
-        pot_risk = norm_risk(risk_levels.get("potassium_sensitivity", "moderate"))
-        pro_risk = norm_risk(risk_levels.get("protein_restriction", "moderate"))
-        carb_risk = norm_risk(risk_levels.get("carb_sensitivity", "moderate"))
-        # Phosphorus risk is high for CKD patients (kidney.org.uk guideline)
-        phos_risk = norm_risk(risk_levels.get("phosphorus_sensitivity", "low"))
-        
-        # Get risk fractions
-        rf = self.config.risk_fractions
+        # Convert severity scores to continuous fractions via sigmoid
+        f_sod = self.severity_to_fraction(sod_sev)
+        f_pot = self.severity_to_fraction(pot_sev)
+        f_pro = self.severity_to_fraction(pro_sev)
+        f_carb = self.severity_to_fraction(carb_sev)
+        f_phos = self.severity_to_fraction(phos_sev)
         
         # Compute grams allowed by each constraint
-        g_sod = self._grams_from_budget(n["sodium_mg"], budget.sodium_mg_remaining, rf[sod_risk])
-        g_pot = self._grams_from_budget(n["potassium_mg"], budget.potassium_mg_remaining, rf[pot_risk])
-        g_pro = self._grams_from_budget(n["protein_g"], budget.protein_g_remaining, rf[pro_risk])
-        g_carb = self._grams_from_budget(n["carbs_g"], budget.carbs_g_remaining, rf[carb_risk])
-        g_phos = self._grams_from_budget(n["phosphorus_mg"], budget.phosphorus_mg_remaining, rf[phos_risk])
+        g_sod = self._grams_from_budget(n["sodium_mg"], budget.sodium_mg_remaining, f_sod)
+        g_pot = self._grams_from_budget(n["potassium_mg"], budget.potassium_mg_remaining, f_pot)
+        g_pro = self._grams_from_budget(n["protein_g"], budget.protein_g_remaining, f_pro)
+        g_carb = self._grams_from_budget(n["carbs_g"], budget.carbs_g_remaining, f_carb)
+        g_phos = self._grams_from_budget(n["phosphorus_mg"], budget.phosphorus_mg_remaining, f_phos)
         
         constraints = {
             "sodium": g_sod,
@@ -417,13 +726,22 @@ class PortionRecommender:
             "carbs_g": round(n["carbs_g"] * factor, 1),
         }
         
-        # Build explanation
+        # Build explanation with severity scores
+        def _label_from(entry):
+            return Model1Integration.get_risk_label(entry) if isinstance(entry, dict) else str(entry)
+        
+        sod_label = _label_from(risk_levels.get("sodium_sensitivity", "moderate"))
+        pot_label = _label_from(risk_levels.get("potassium_sensitivity", "moderate"))
+        pro_label = _label_from(risk_levels.get("protein_restriction", "moderate"))
+        carb_label = _label_from(risk_levels.get("carb_sensitivity", "moderate"))
+        phos_label = _label_from(risk_levels.get("phosphorus_sensitivity", "low"))
+        
         risk_explanations = {
-            "sodium": f"sodium sensitivity ({sod_risk})",
-            "potassium": f"potassium sensitivity ({pot_risk})",
-            "protein": f"protein restriction ({pro_risk})",
-            "carbs": f"carb sensitivity ({carb_risk})",
-            "phosphorus": f"phosphorus restriction ({phos_risk}) - CKD guideline",
+            "sodium": f"sodium sensitivity ({sod_label}, sev={sod_sev:.2f})",
+            "potassium": f"potassium sensitivity ({pot_label}, sev={pot_sev:.2f})",
+            "protein": f"protein restriction ({pro_label}, sev={pro_sev:.2f})",
+            "carbs": f"carb sensitivity ({carb_label}, sev={carb_sev:.2f})",
+            "phosphorus": f"phosphorus restriction ({phos_label}, sev={phos_sev:.2f}) - CKD guideline",
         }
         
         explanation = (
@@ -476,17 +794,31 @@ class BudgetCalculator:
         consumed_today: Optional[Dict[str, float]] = None
     ) -> DailyBudget:
         """
-        Get remaining daily budget based on conditions.
-        
+        Get base daily budget based on disease conditions.
+
+        Clinical rationale:
+        Returns the full-day nutrient allowance before any consumption.
+        Consumption tracking is now handled by NutrientLedger.
+
         Args:
             has_ckd: Has chronic kidney disease
             has_htn: Has hypertension
             has_dm: Has diabetes
-            consumed_today: Nutrients already consumed (optional)
-        
+            consumed_today: DEPRECATED — use NutrientLedger instead.
+                Kept for backward compatibility; ignored if provided.
+
         Returns:
-            DailyBudget with remaining nutrient allowances
+            DailyBudget with full daily nutrient allowances
         """
+        if consumed_today is not None:
+            import warnings as _w
+            _w.warn(
+                "consumed_today is deprecated and ignored. "
+                "Use NutrientLedger.get_remaining_budget() instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         # Determine condition key
         conditions = []
         if has_ckd:
@@ -495,32 +827,29 @@ class BudgetCalculator:
             conditions.append("htn")
         if has_dm:
             conditions.append("dm")
-        
+
         if not conditions:
             key = "healthy"
         else:
             key = "_".join(sorted(conditions))
-        
+
         # Get base budget (fall back to most restrictive if combo not defined)
         budgets = self.config.daily_budgets
         if key in budgets:
             base = budgets[key]
         elif "ckd_htn_dm" in budgets and has_ckd:
-            base = budgets["ckd_htn_dm"]  # Most restrictive
+            base = budgets["ckd_htn_dm"]
         elif "ckd" in budgets and has_ckd:
             base = budgets["ckd"]
         else:
             base = budgets["healthy"]
-        
-        # Subtract already consumed
-        consumed = consumed_today or {}
-        
+
         return DailyBudget(
-            sodium_mg_remaining=max(0, base["sodium_mg"] - consumed.get("sodium_mg", 0)),
-            potassium_mg_remaining=max(0, base["potassium_mg"] - consumed.get("potassium_mg", 0)),
-            protein_g_remaining=max(0, base["protein_g"] - consumed.get("protein_g", 0)),
-            carbs_g_remaining=max(0, base["carbs_g"] - consumed.get("carbs_g", 0)),
-            phosphorus_mg_remaining=max(0, base.get("phosphorus_mg", 700) - consumed.get("phosphorus_mg", 0)),
+            sodium_mg_remaining=base["sodium_mg"],
+            potassium_mg_remaining=base["potassium_mg"],
+            protein_g_remaining=base["protein_g"],
+            carbs_g_remaining=base["carbs_g"],
+            phosphorus_mg_remaining=base.get("phosphorus_mg", 700),
         )
 
 
@@ -594,6 +923,9 @@ class PortionControlModel:
         self.budget_calc = BudgetCalculator(self.config)
         self.input_handler = IngredientInputHandler(self.ifct)
         
+        # Initialize daily nutrient ledger
+        self.ledger = NutrientLedger()
+        
         print("✓ Model2 initialization complete")
         print("="*60 + "\n")
     
@@ -605,6 +937,12 @@ class PortionControlModel:
     ) -> Dict[str, Any]:
         """
         Get portion recommendations for ingredients given patient data.
+
+        Clinical rationale:
+        The budget now reflects what the patient has already eaten today
+        (via the NutrientLedger), not just the full-day allowance. This
+        ensures that a CKD patient who ate 900 mg sodium at breakfast
+        sees only 1100 mg headroom for subsequent meals.
         
         Args:
             patient_data: Clinical data dict with keys:
@@ -612,7 +950,7 @@ class PortionControlModel:
                 - serum_sodium, serum_potassium, creatinine, egfr
                 - hba1c, fbs, sbp, dbp, bmi
             ingredients: List of ingredient names
-            consumed_today: Already consumed nutrients (optional)
+            consumed_today: DEPRECATED — ignored; ledger tracks this
         
         Returns:
             Dict with risk_levels, budget, recommendations, and summary
@@ -620,13 +958,13 @@ class PortionControlModel:
         # Step 1: Get risk levels from Model1
         risk_levels = self.model1.predict_risk_levels(patient_data)
         
-        # Step 2: Calculate remaining budget
-        budget = self.budget_calc.get_daily_budget(
+        # Step 2: Calculate remaining budget from ledger
+        base_budget = self.budget_calc.get_daily_budget(
             has_ckd=patient_data.get("has_ckd", 0) == 1,
             has_htn=patient_data.get("has_htn", 0) == 1,
             has_dm=patient_data.get("has_dm", 0) == 1,
-            consumed_today=consumed_today
         )
+        budget = self.ledger.get_remaining_budget(base_budget)
         
         # Step 3: Get portion recommendations
         recommendations = self.recommender.recommend_batch(ingredients, risk_levels, budget)
@@ -667,6 +1005,46 @@ class PortionControlModel:
                 "avoid": avoid,
             }
         }
+    
+    def confirm_meal(
+        self,
+        meal_name: str,
+        portions: List[PortionDecision],
+    ) -> Dict[str, float]:
+        """
+        Record a confirmed meal in the daily nutrient ledger.
+
+        Clinical rationale:
+        Called by the chatbot / user interface layer after the user confirms
+        what they actually ate. Only confirmed meals should affect the budget
+        for subsequent recommendations — tentative queries must not.
+
+        Parameters
+        ----------
+        meal_name : str
+            Human-readable label (e.g. 'Breakfast', 'Lunch').
+        portions : list of PortionDecision
+            The accepted portion recommendations.
+
+        Returns
+        -------
+        dict : nutrients consumed in this meal
+        """
+        return self.ledger.log_accepted_portions(meal_name, portions, self.ifct)
+    
+    def get_daily_summary(self) -> Dict[str, Any]:
+        """
+        Proxy to NutrientLedger.daily_summary().
+
+        Clinical rationale:
+        Provides a running view of the patient's daily intake, meal history,
+        and remaining budget headroom for clinician/patient review.
+
+        Returns
+        -------
+        dict with consumed_totals, meals, meal_count
+        """
+        return self.ledger.daily_summary()
     
     def interactive_mode(self):
         """Run interactive ingredient input mode"""
@@ -720,7 +1098,12 @@ class PortionControlModel:
         
         print(f"\nPatient Risk Levels (from Model1):")
         for key, val in results["risk_levels"].items():
-            print(f"  • {key}: {val}")
+            if isinstance(val, dict):
+                print(f"  • {key}: {val['label']} "
+                      f"(sev={val['severity_score']:.3f}, "
+                      f"conf={val['confidence']:.3f})")
+            else:
+                print(f"  • {key}: {val}")
         
         print(f"\nDaily Budget Remaining:")
         for key, val in results["daily_budget"].items():
@@ -751,7 +1134,7 @@ def main():
     # Initialize model
     model = PortionControlModel()
     
-    # Test patient with CKD + HTN + DM
+    # Test patient with CKD + HTN + DM (standard test patient)
     patient = {
         "age": 55,
         "sex_male": 1,
@@ -766,7 +1149,7 @@ def main():
         "fbs": 170,
         "sbp": 152,
         "dbp": 94,
-        "bmi": 32
+        "bmi": 29
     }
     
     # Test ingredients
@@ -791,7 +1174,12 @@ def main():
     # Display results
     print("\n📋 Risk Levels (from Model1):")
     for key, val in results["risk_levels"].items():
-        print(f"   {key}: {val}")
+        if isinstance(val, dict):
+            print(f"   {key}: {val['label']} "
+                  f"(severity={val['severity_score']:.3f}, "
+                  f"confidence={val['confidence']:.3f})")
+        else:
+            print(f"   {key}: {val}")
     
     print("\n📊 Daily Budget:")
     for key, val in results["daily_budget"].items():
@@ -815,6 +1203,108 @@ def main():
     print(f"\n✓ ALLOWED: {', '.join(results['summary']['allowed']) or 'None'}")
     print(f"⚠ HALF PORTION: {', '.join(results['summary']['half_portion']) or 'None'}")
     print(f"✗ AVOID: {', '.join(results['summary']['avoid']) or 'None'}")
+    
+    # ==========================================
+    # VALIDATION: Two-patient differentiation
+    # ==========================================
+    print("\n" + "="*60)
+    print("VALIDATION: TWO-PATIENT DIFFERENTIATION")
+    print("Different severity_scores → different max_grams for Chicken")
+    print("="*60)
+    
+    # Patient A: eGFR=55, no CKD flag, lower creatinine → moderate protein severity
+    patient_a = dict(patient, egfr=55, creatinine=1.3, has_ckd=0)
+    # Patient B: eGFR=28, CKD flag, high creatinine → high protein severity
+    patient_b = patient  # already eGFR=28
+    
+    test_ingredient = "Chicken, breast"
+    
+    results_a = model.get_recommendations(patient_a, [test_ingredient])
+    results_b = model.get_recommendations(patient_b, [test_ingredient])
+    
+    pro_a = results_a["risk_levels"].get("protein_restriction", {})
+    pro_b = results_b["risk_levels"].get("protein_restriction", {})
+    
+    rec_a = results_a["recommendations"][0]
+    rec_b = results_b["recommendations"][0]
+    
+    print(f"\n  Patient A (eGFR=55, no CKD):")
+    if isinstance(pro_a, dict):
+        print(f"    protein_restriction: label={pro_a['label']}, "
+              f"severity={pro_a['severity_score']:.4f}")
+    print(f"    {test_ingredient}: max_grams={rec_a['max_grams']}g, label={rec_a['label']}")
+    
+    print(f"\n  Patient B (eGFR=28, CKD):")
+    if isinstance(pro_b, dict):
+        print(f"    protein_restriction: label={pro_b['label']}, "
+              f"severity={pro_b['severity_score']:.4f}")
+    print(f"    {test_ingredient}: max_grams={rec_b['max_grams']}g, label={rec_b['label']}")
+    
+    grams_diff = rec_a['max_grams'] - rec_b['max_grams']
+    print(f"\n  ✓ Difference: {grams_diff:.1f}g "
+          f"({'Patient B is more restricted — correct!' if grams_diff > 0 else 'UNEXPECTED'})")
+    
+    # ==========================================
+    # VALIDATION: NutrientLedger (Phase 1B)
+    # ==========================================
+    print("\n" + "="*60)
+    print("VALIDATION: NUTRIENT LEDGER — BUDGET DEPLETION")
+    print("="*60)
+    
+    # Reset ledger for a clean test
+    model.ledger._reset()
+    
+    # --- BREAKFAST ---
+    breakfast_items = ["Rice, milled (white)", "Curd (Dahi/Yogurt)", "Banana, ripe"]
+    breakfast = model.get_recommendations(patient, breakfast_items)
+    breakfast_budget = breakfast["daily_budget"]
+    print(f"\n  BREAKFAST budget (before any meal):")
+    print(f"    sodium={breakfast_budget['sodium_mg']:.0f}mg, "
+          f"potassium={breakfast_budget['potassium_mg']:.0f}mg, "
+          f"protein={breakfast_budget['protein_g']:.1f}g")
+    
+    # Build PortionDecision objects for confirm_meal
+    breakfast_portions = [
+        PortionDecision(
+            ingredient=r["ingredient"],
+            max_grams=r["max_grams"],
+            label=r["label"],
+            explanation=r["explanation"],
+            nutrient_load_at_max=r["nutrient_load"],
+            binding_constraint=r["binding_constraint"],
+        )
+        for r in breakfast["recommendations"]
+    ]
+    
+    # Confirm breakfast
+    meal_nutrients = model.confirm_meal("Breakfast", breakfast_portions)
+    print(f"\n  ✓ Breakfast confirmed — consumed:")
+    print(f"    sodium={meal_nutrients['sodium_mg']:.0f}mg, "
+          f"potassium={meal_nutrients['potassium_mg']:.0f}mg, "
+          f"protein={meal_nutrients['protein_g']:.1f}g")
+    
+    # --- LUNCH ---
+    lunch_items = ["Chicken, breast", "Potato (Aloo)", "Tomato, ripe"]
+    lunch = model.get_recommendations(patient, lunch_items)
+    lunch_budget = lunch["daily_budget"]
+    print(f"\n  LUNCH budget (after breakfast):")
+    print(f"    sodium={lunch_budget['sodium_mg']:.0f}mg, "
+          f"potassium={lunch_budget['potassium_mg']:.0f}mg, "
+          f"protein={lunch_budget['protein_g']:.1f}g")
+    
+    # Verify budget decreased
+    sod_decreased = lunch_budget["sodium_mg"] < breakfast_budget["sodium_mg"]
+    print(f"\n  ✓ Budget decreased after breakfast: {sod_decreased} "
+          f"({'CORRECT' if sod_decreased else 'FAILED'})")
+    
+    # --- DAILY SUMMARY ---
+    summary = model.get_daily_summary()
+    print(f"\n  Daily Summary: {summary['meal_count']} meal(s) logged")
+    print(f"    Total consumed: sodium={summary['consumed_totals']['sodium_mg']:.0f}mg, "
+          f"potassium={summary['consumed_totals']['potassium_mg']:.0f}mg, "
+          f"protein={summary['consumed_totals']['protein_g']:.1f}g")
+    for m in summary["meals"]:
+        print(f"    • {m['meal_name']}: {', '.join(m['items'])}")
     
     return model
 

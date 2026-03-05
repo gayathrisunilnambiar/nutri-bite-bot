@@ -13,7 +13,9 @@ import joblib
 import argparse
 import json
 
-import lightgbm as lgb
+from ngboost import NGBClassifier
+from ngboost.distns import k_categorical
+from sklearn.isotonic import IsotonicRegression
 from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
@@ -21,6 +23,8 @@ from sklearn.metrics import (
     classification_report, confusion_matrix, accuracy_score,
     precision_score, recall_score, f1_score, cohen_kappa_score,
 )
+import warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='ngboost')
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
@@ -60,17 +64,11 @@ class ClinicalModelConfig:
         "carb_sensitivity",
     )
     
-    lgbm_params: Dict[str, Any] = field(default_factory=lambda: {
-        "objective": "multiclass",
-        "num_class": 3,
-        "learning_rate": 0.05,
+    ngboost_params: Dict[str, Any] = field(default_factory=lambda: {
         "n_estimators": 600,
-        "num_leaves": 31,
-        "subsample": 0.9,
-        "colsample_bytree": 0.9,
-        "reg_lambda": 1.0,
+        "learning_rate": 0.05,
         "random_state": 42,
-        "verbose": -1,
+        "verbose": False,
     })
     
     model_dir: Path = Path("../artifacts/models")
@@ -726,16 +724,90 @@ def build_monotonic_constraints(features: List[str]) -> List[int]:
 
 
 # ===============================
+# Monotonic Feature Transformer
+# ===============================
+
+class MonotonicFeatureTransformer:
+    """
+    Enforce clinical monotonicity via IsotonicRegression preprocessing.
+
+    Clinical rationale:
+    NGBoost does not natively support monotone_constraints. However, certain
+    lab values have a known dose-response relationship with dietary risk:
+      - Rising creatinine, serum_potassium, hba1c, fbs, sbp, dbp, bmi all
+        increase restriction risk (+1 constraint)
+      - Rising eGFR decreases restriction risk (-1 constraint)
+    By fitting an IsotonicRegression on each constrained feature (mapping
+    feature value -> mean target ordinal), we reshape the feature so that
+    the tree learner receives a monotonically-transformed input, preserving
+    the known clinical relationship without distorting unconstrained features.
+
+    The transformer is fit on training data only and applied to both train
+    and test to prevent data leakage.
+    """
+
+    def __init__(self, feature_names: List[str], constraints: List[int]):
+        """
+        Parameters
+        ----------
+        feature_names : list of str
+            Column names in the same order as X columns.
+        constraints : list of int
+            Output of build_monotonic_constraints(); +1, -1, or 0 per feature.
+        """
+        self.feature_names = feature_names
+        self.constraints = constraints
+        self.isotonic_models: Dict[int, IsotonicRegression] = {}
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "MonotonicFeatureTransformer":
+        """
+        Fit isotonic regressions on constrained features using mean target
+        as the response variable.
+
+        Clinical rationale:
+        We use the mean ordinal target (0=Low, 1=Moderate, 2=High averaged
+        across all four targets) as the supervision signal. This gives the
+        isotonic function a clinically-grounded mapping from lab value to
+        risk magnitude.
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (n_samples, n_features)
+        y : np.ndarray, shape (n_samples,)
+            Mean ordinal target across all sensitivity targets.
+        """
+        for i, (fname, c) in enumerate(zip(self.feature_names, self.constraints)):
+            if c == 0:
+                continue
+            increasing = (c == +1)
+            iso = IsotonicRegression(
+                increasing=increasing,
+                out_of_bounds="clip",
+            )
+            iso.fit(X[:, i], y)
+            self.isotonic_models[i] = iso
+        return self
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """Apply fitted isotonic regressions to constrained features."""
+        X_out = X.copy()
+        for i, iso in self.isotonic_models.items():
+            X_out[:, i] = iso.transform(X_out[:, i])
+        return X_out
+
+
+# ===============================
 # Clinical Risk Stratifier
 # ===============================
 
 class ClinicalRiskStratifier:
-    """Train and evaluate clinical risk models"""
+    """Train and evaluate clinical risk models using NGBoost probabilistic classifiers."""
     
     def __init__(self, cfg: ClinicalModelConfig):
         self.cfg = cfg
-        self.models: Dict[str, lgb.LGBMClassifier] = {}
+        self.models: Dict[str, NGBClassifier] = {}
         self.imputer = None
+        self.mono_transformer: Optional[MonotonicFeatureTransformer] = None
         self.scaler = None
         
     def fit(self, df: pd.DataFrame):
@@ -774,17 +846,31 @@ class ClinicalRiskStratifier:
         
         print(f"\nTrain size: {len(X_train)}, Test size: {len(X_test)}")
         
-        # Train model for each target and collect predictions
+        # Fit MonotonicFeatureTransformer on training data only
+        # Use mean ordinal target as supervision signal for isotonic fitting
+        y_mean_ordinal = y_train[list(self.cfg.targets)].mean(axis=1).values
+        self.mono_transformer = MonotonicFeatureTransformer(available_cols, mono)
+        self.mono_transformer.fit(X_train, y_mean_ordinal)
+        
+        # Apply monotonic transform to both train and test
+        X_train = self.mono_transformer.transform(X_train)
+        X_test_transformed = self.mono_transformer.transform(X_test)
+        
+        print(f"  ✓ Monotonic feature transformer fitted on {len(available_cols)} features")
+        
+        # Train NGBoost model for each target and collect predictions
         y_predictions = {}
         for target in self.cfg.targets:
             print(f"\n--- Training: {target} ---")
             
-            model = lgb.LGBMClassifier(**self.cfg.lgbm_params)
-            model.set_params(monotone_constraints=mono)
+            model = NGBClassifier(
+                Dist=k_categorical(3),
+                **self.cfg.ngboost_params,
+            )
             model.fit(X_train, y_train[target])
             
             self.models[target] = model
-            y_predictions[target] = model.predict(X_test)
+            y_predictions[target] = model.predict(X_test_transformed)
         
         # Store feature names for prediction
         self.feature_names = available_cols
@@ -802,17 +888,52 @@ class ClinicalRiskStratifier:
         )
         
     def predict(self, clinical_input: Dict[str, Any]) -> Dict[str, Any]:
-        """Get risk predictions AND permissible nutrient amounts for a patient."""
+        """
+        Get risk predictions AND permissible nutrient amounts for a patient.
+
+        Clinical rationale:
+        NGBoost outputs a full probability distribution over {Low, Moderate, High}
+        for each sensitivity target. We extract:
+          - label: the argmax class (backward compat)
+          - severity_score: probability-weighted class index ∈ [0.0, 2.0],
+            capturing where the patient sits on the continuous risk spectrum
+          - confidence: max class probability
+          - proba: per-class probability dict
+        This allows downstream PortionRecommender to use continuous fractions
+        instead of discrete risk buckets.
+        """
         X = pd.DataFrame([clinical_input])[self.feature_names]
         X = self.imputer.transform(X)
         X = self.scaler.transform(X)
+        if self.mono_transformer is not None:
+            X = self.mono_transformer.transform(X)
         
         label_map = {0: "low", 1: "moderate", 2: "high"}
+        class_indices = np.array([0, 1, 2], dtype=float)
         
-        risk_levels = {
-            target: label_map[int(model.predict(X)[0])]
-            for target, model in self.models.items()
-        }
+        risk_levels = {}
+        for target, model in self.models.items():
+            pred_label = int(model.predict(X)[0])
+            # Extract probability distribution from NGBoost
+            dist_params = model.pred_dist(X).params
+            # dist_params is dict with 'p0', 'p1', 'p2' keys (k_categorical)
+            probas = np.array([dist_params[f'p{i}'][0] for i in range(3)])
+            # Ensure probabilities sum to 1 (numerical safety)
+            probas = probas / probas.sum()
+            
+            severity_score = float(np.dot(probas, class_indices))
+            confidence = float(probas.max())
+            
+            risk_levels[target] = {
+                "label": label_map[pred_label],
+                "severity_score": round(severity_score, 4),
+                "confidence": round(confidence, 4),
+                "proba": {
+                    "low": round(float(probas[0]), 4),
+                    "moderate": round(float(probas[1]), 4),
+                    "high": round(float(probas[2]), 4),
+                },
+            }
         
         # Get condition-specific permissible nutrient amounts
         threshold_engine = NutrientThresholdEngine()
@@ -824,7 +945,7 @@ class ClinicalRiskStratifier:
         }
     
     def save(self):
-        """Save trained models"""
+        """Save trained NGBoost models, preprocessing artifacts, and monotonic transformer."""
         self.cfg.model_dir.mkdir(parents=True, exist_ok=True)
         
         for target, model in self.models.items():
@@ -835,6 +956,14 @@ class ClinicalRiskStratifier:
         joblib.dump(self.imputer, self.cfg.model_dir / "imputer.joblib")
         joblib.dump(self.scaler, self.cfg.model_dir / "scaler.joblib")
         joblib.dump(self.feature_names, self.cfg.model_dir / "feature_names.joblib")
+        
+        # Save monotonic feature transformer
+        if self.mono_transformer is not None:
+            joblib.dump(
+                self.mono_transformer,
+                self.cfg.model_dir / "monotonic_transformer.joblib",
+            )
+            print(f"  ✓ Saved: {self.cfg.model_dir / 'monotonic_transformer.joblib'}")
         
         print(f"\n  ✓ All models saved to: {self.cfg.model_dir}")
 
@@ -906,8 +1035,13 @@ def main(sample_rows: int = 100000):
     
     print(f"\nTest patient: HTN + DM + CKD (eGFR=28)")
     print(f"\n  Risk Levels:")
-    for target, risk in predictions["risk_levels"].items():
-        print(f"    {target}: {risk}")
+    for target, risk_info in predictions["risk_levels"].items():
+        if isinstance(risk_info, dict):
+            print(f"    {target}: {risk_info['label']} "
+                  f"(severity={risk_info['severity_score']:.3f}, "
+                  f"confidence={risk_info['confidence']:.3f})")
+        else:
+            print(f"    {target}: {risk_info}")
     
     pa = predictions["permissible_amounts"]
     print(f"\n  Condition Profile: {pa['condition_profile']}")

@@ -4,51 +4,51 @@ CLINICAL MODEL #1 — ACCURACY ANALYSIS SUMMARY
 
 Target: sodium_sensitivity
 ----------------------------------------
-  accuracy                  : 0.9975
-  precision_macro           : 0.9896
-  precision_weighted        : 0.9975
-  recall_macro              : 0.9915
-  recall_weighted           : 0.9975
-  f1_macro                  : 0.9906
-  f1_weighted               : 0.9975
-  cohen_kappa               : 0.9953
+  accuracy                  : 0.9999
+  precision_macro           : 0.9999
+  precision_weighted        : 0.9999
+  recall_macro              : 1.0000
+  recall_weighted           : 0.9999
+  f1_macro                  : 1.0000
+  f1_weighted               : 0.9999
+  cohen_kappa               : 0.9999
 
 Target: potassium_sensitivity
 ----------------------------------------
-  accuracy                  : 0.9984
-  precision_macro           : 0.9979
-  precision_weighted        : 0.9984
-  recall_macro              : 0.9980
-  recall_weighted           : 0.9984
-  f1_macro                  : 0.9979
-  f1_weighted               : 0.9984
-  cohen_kappa               : 0.9974
+  accuracy                  : 0.9999
+  precision_macro           : 0.9997
+  precision_weighted        : 0.9999
+  recall_macro              : 0.9999
+  recall_weighted           : 0.9999
+  f1_macro                  : 0.9998
+  f1_weighted               : 0.9999
+  cohen_kappa               : 0.9998
 
 Target: protein_restriction
 ----------------------------------------
-  accuracy                  : 0.9995
-  precision_macro           : 0.9992
-  precision_weighted        : 0.9995
-  recall_macro              : 0.9988
-  recall_weighted           : 0.9995
-  f1_macro                  : 0.9990
-  f1_weighted               : 0.9995
-  cohen_kappa               : 0.9989
+  accuracy                  : 0.9999
+  precision_macro           : 0.9999
+  precision_weighted        : 0.9999
+  recall_macro              : 0.9998
+  recall_weighted           : 0.9999
+  f1_macro                  : 0.9998
+  f1_weighted               : 0.9999
+  cohen_kappa               : 0.9999
 
 Target: carb_sensitivity
 ----------------------------------------
-  accuracy                  : 0.9975
-  precision_macro           : 0.9976
-  precision_weighted        : 0.9975
-  recall_macro              : 0.9966
-  recall_weighted           : 0.9975
-  f1_macro                  : 0.9971
-  f1_weighted               : 0.9975
-  cohen_kappa               : 0.9955
+  accuracy                  : 0.9971
+  precision_macro           : 0.9975
+  precision_weighted        : 0.9971
+  recall_macro              : 0.9972
+  recall_weighted           : 0.9971
+  f1_macro                  : 0.9974
+  f1_weighted               : 0.9971
+  cohen_kappa               : 0.9950
 
 ======================================================================
 OVERALL (macro-averaged across targets)
 ======================================================================
-  Mean Accuracy:     0.9982
-  Mean F1 (wt):      0.9982
-  Mean Cohen Kappa:  0.9968
+  Mean Accuracy:     0.9992
+  Mean F1 (wt):      0.9992
+  Mean Cohen Kappa:  0.9986
