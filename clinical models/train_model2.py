@@ -102,6 +102,16 @@ class Model2Config:
     default_cap_g: float = 300.0     # Max grams per ingredient
     half_portion_g: float = 75.0     # Below this = "Half portion"
     avoid_threshold_g: float = 5.0   # Below this = "Avoid"
+    
+    # Phosphorus-protein efficiency multipliers (Phase 1C — KDIGO 2024)
+    phos_efficiency_bonus: float = 1.20   # ×1.20 for CKD-preferred (excellent/good tier)
+    phos_efficiency_penalty: float = 0.75 # ×0.75 for poor-tier high-phosphorus sources
+    
+    # KDIGO 2024 phos/protein ratio tier thresholds (mg phosphorus per g protein)
+    # Calibrated to IFCT 2017 distribution: min≈7, median≈20, max≈40
+    phos_tier_excellent: float = 12.0   # ≤ 12 mg/g  — best quartile
+    phos_tier_good: float = 18.0        # ≤ 18 mg/g  — below median
+    phos_tier_moderate: float = 25.0    # ≤ 25 mg/g  — below 75th pctile
 
 
 # ===============================
@@ -188,6 +198,121 @@ class IFCTDatabase:
     def get_all_categories(self) -> List[str]:
         """Get list of all categories"""
         return self.df["category"].unique().tolist()
+    
+    def get_phos_protein_efficiency(
+        self,
+        ingredient: str,
+        config: Model2Config = None,
+    ) -> Dict[str, Any]:
+        """
+        Phosphorus-to-protein efficiency scoring (KDIGO 2024).
+
+        Clinical rationale:
+        Not all protein sources carry equal phosphorus burden. Egg whites
+        (ratio ~1.4 mg/g) are far preferable for CKD patients than processed
+        cheese (~47 mg/g). This method quantifies that difference so
+        PortionRecommender can bonus/penalise portions accordingly.
+
+        Parameters
+        ----------
+        ingredient : str
+            Name of ingredient (must exist in IFCT).
+        config : Model2Config, optional
+            Supplies tier thresholds; defaults to Model2Config() if None.
+
+        Returns
+        -------
+        dict with keys:
+            phos_per_g_protein : float
+            efficiency_tier    : str  (excellent / good / moderate / poor)
+            ckd_preferred      : bool (True for excellent and good)
+        """
+        if config is None:
+            config = Model2Config()
+
+        key = ingredient.lower().strip()
+        if key not in self.idx.index:
+            # Unknown ingredient → neutral moderate
+            return {
+                "phos_per_g_protein": 0.0,
+                "efficiency_tier": "moderate",
+                "ckd_preferred": False,
+            }
+
+        row = self.idx.loc[key]
+        protein = float(row.get("protein_g_per_100g", 0))
+        phosphorus = float(row.get("phosphorus_mg_per_100g", 0))
+
+        # Guard divide-by-zero / missing protein
+        if protein <= 0:
+            return {
+                "phos_per_g_protein": 0.0,
+                "efficiency_tier": "moderate",
+                "ckd_preferred": False,
+            }
+
+        ratio = phosphorus / protein
+
+        if ratio <= config.phos_tier_excellent:
+            tier = "excellent"
+        elif ratio <= config.phos_tier_good:
+            tier = "good"
+        elif ratio <= config.phos_tier_moderate:
+            tier = "moderate"
+        else:
+            tier = "poor"
+
+        return {
+            "phos_per_g_protein": round(ratio, 2),
+            "efficiency_tier": tier,
+            "ckd_preferred": tier in ("excellent", "good"),
+        }
+    
+    def get_ckd_friendly_proteins(
+        self,
+        config: Model2Config = None,
+        min_protein_g: float = 3.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Ranked list of CKD-preferred protein sources.
+
+        Clinical rationale:
+        Proactively surfaces ingredients with low phosphorus burden per gram
+        of protein so the chatbot layer can suggest CKD-safe options without
+        requiring an explicit ingredient query from the patient.
+
+        Parameters
+        ----------
+        config : Model2Config, optional
+            Supplies tier thresholds; defaults to Model2Config().
+        min_protein_g : float
+            Minimum protein per 100g to qualify as a "protein source".
+
+        Returns
+        -------
+        List[dict] sorted ascending by phos_per_g_protein, each dict:
+            ingredient, phos_per_g_protein, efficiency_tier
+        """
+        if config is None:
+            config = Model2Config()
+
+        results = []
+        for _, row in self.df.iterrows():
+            protein = float(row.get("protein_g_per_100g", 0))
+            if protein < min_protein_g:
+                continue
+            eff = self.get_phos_protein_efficiency(
+                row["ingredient"], config=config
+            )
+            if eff["ckd_preferred"]:
+                results.append({
+                    "ingredient": row["ingredient"],
+                    "phos_per_g_protein": eff["phos_per_g_protein"],
+                    "efficiency_tier": eff["efficiency_tier"],
+                })
+
+        results.sort(key=lambda x: x["phos_per_g_protein"])
+        return results
 
 
 # ===============================
@@ -375,6 +500,247 @@ class NutrientLedger:
             "meals": list(self._meals),
             "meal_count": len(self._meals),
         }
+
+
+# ===============================
+# Caloric Sufficiency Validator
+# ===============================
+class CaloricSufficiencyValidator:
+    """
+    Detects when overlapping nutrient restrictions produce a
+    calorically inadequate meal plan, and applies KDIGO-prioritized
+    constraint relaxation to restore caloric adequacy.
+
+    Clinical rationale:
+    A CKD Stage 4 + DM + HTN patient may face simultaneous HIGH
+    restrictions on protein, carbs, potassium, sodium, and phosphorus.
+    The intersection can make it impossible to reach 1200 kcal/day.
+    KDIGO 2024 explicitly states that malnutrition risk must be weighed
+    against disease progression — protein restriction should be relaxed
+    before allowing a patient to starve.
+    """
+
+    # --- Class constants ---
+    MIN_KCAL_THRESHOLD: float = 1200.0   # Below this = nutritionally inadequate
+    TARGET_KCAL: float = 1800.0          # Desired caloric target
+
+    # Relaxation priority: relax *first* item first.
+    # Potassium and sodium are NEVER relaxed (cardiac arrest / fluid risk).
+    RELAXATION_PRIORITY = [
+        {
+            "constraint": "protein_restriction",
+            "max_reduction": None,           # no cap — malnutrition outweighs CKD progression
+            "rationale": "KDIGO 2024: malnutrition risk outweighs CKD progression; "
+                         "protein restriction is the first target to relax.",
+        },
+        {
+            "constraint": "carb_sensitivity",
+            "max_reduction": None,           # relax if protein alone insufficient
+            "rationale": "Relaxing carb sensitivity second when protein relaxation alone "
+                         "cannot restore caloric adequacy.",
+        },
+        {
+            "constraint": "phosphorus_sensitivity",
+            "max_reduction": 0.20,           # marginal: ≤ 10% of 2.0 scale = 0.20
+            "rationale": "Marginal phosphorus relaxation (max −0.20 severity) to "
+                         "support caloric adequacy without excessive phosphorus load.",
+        },
+    ]
+
+    # Constraints that must NEVER be relaxed
+    IMMUTABLE_CONSTRAINTS = frozenset({"sodium_sensitivity", "potassium_sensitivity"})
+
+    def __init__(self, ifct: "IFCTDatabase", recommender: "PortionRecommender"):
+        self.ifct = ifct
+        self.recommender = recommender
+
+    # ---- helpers ----
+
+    def _estimate_kcal(
+        self,
+        recommendations: List[PortionDecision],
+    ) -> float:
+        """
+        Sum projected calories across all non-Avoid portions.
+
+        For each non-Avoid item: calories = (max_grams / 100) * calories_per_100g
+        """
+        total = 0.0
+        for rec in recommendations:
+            if rec.label == "Avoid":
+                continue
+            try:
+                n = self.ifct.get_nutrients_per_100g(rec.ingredient)
+                total += (rec.max_grams / 100.0) * n.get("calories", 0)
+            except KeyError:
+                continue
+        return round(total, 1)
+
+    # ---- Task 1: validate ----
+
+    def validate(
+        self,
+        recommendations: List[PortionDecision],
+    ) -> Dict[str, Any]:
+        """
+        Check whether the combined recommendations meet caloric
+        adequacy per KDIGO 2024 minimum thresholds.
+
+        Parameters
+        ----------
+        recommendations : list of PortionDecision
+
+        Returns
+        -------
+        dict with:
+            is_sufficient   : bool
+            projected_kcal  : float
+            deficit_kcal    : float  (0 when sufficient)
+            relaxations_needed : list of constraint names
+        """
+        projected = self._estimate_kcal(recommendations)
+        is_sufficient = projected >= self.MIN_KCAL_THRESHOLD
+        deficit = max(0.0, self.MIN_KCAL_THRESHOLD - projected)
+
+        relaxations_needed: List[str] = []
+        if not is_sufficient:
+            for entry in self.RELAXATION_PRIORITY:
+                relaxations_needed.append(entry["constraint"])
+
+        return {
+            "is_sufficient": is_sufficient,
+            "projected_kcal": projected,
+            "deficit_kcal": round(deficit, 1),
+            "relaxations_needed": relaxations_needed,
+        }
+
+    # ---- Task 2: reconcile ----
+
+    def reconcile(
+        self,
+        validation_result: Dict[str, Any],
+        risk_levels: Dict[str, Any],
+        budget: "DailyBudget",
+        ingredients: List[str],
+        severity_reduction_step: float = 0.3,
+    ) -> Dict[str, Any]:
+        """
+        Apply KDIGO-prioritized constraint relaxation until projected
+        calories exceed MIN_KCAL_THRESHOLD, or all relaxable constraints
+        have been fully reduced.
+
+        Parameters
+        ----------
+        validation_result : dict from validate()
+        risk_levels : current risk_levels dict (will be deep-copied)
+        budget : DailyBudget for recommender re-runs
+        ingredients : list of ingredient names for re-estimation
+        severity_reduction_step : how much to reduce severity each iteration
+
+        Returns
+        -------
+        Modified risk_levels dict with:
+            reconciliation_applied : bool
+            reconciliation_log     : list of dicts {constraint, old_sev, new_sev, rationale}
+        """
+        import copy
+
+        # Enforce immutability assertions
+        for immutable in self.IMMUTABLE_CONSTRAINTS:
+            assert immutable not in [
+                e["constraint"] for e in self.RELAXATION_PRIORITY
+            ], f"CRITICAL: {immutable} must never appear in RELAXATION_PRIORITY"
+
+        if validation_result["is_sufficient"]:
+            modified = copy.deepcopy(risk_levels)
+            modified["reconciliation_applied"] = False
+            modified["reconciliation_log"] = []
+            return modified
+
+        modified = copy.deepcopy(risk_levels)
+        log: List[Dict[str, Any]] = []
+        projected = validation_result["projected_kcal"]
+
+        for entry in self.RELAXATION_PRIORITY:
+            constraint = entry["constraint"]
+            max_reduction = entry["max_reduction"]
+            rationale = entry["rationale"]
+
+            if constraint not in modified:
+                continue
+
+            total_reduced = 0.0
+
+            while projected < self.MIN_KCAL_THRESHOLD:
+                current = self._extract_severity(modified[constraint])
+
+                # Stop if severity is already at floor
+                if current <= 0.0:
+                    break
+
+                # Honour per-constraint max reduction
+                if max_reduction is not None and total_reduced >= max_reduction:
+                    break
+
+                # Calculate actual step (may be clamped)
+                step = severity_reduction_step
+                if max_reduction is not None:
+                    step = min(step, max_reduction - total_reduced)
+                step = min(step, current)  # don't go below 0
+
+                old_sev = current
+                new_sev = round(current - step, 4)
+
+                # Apply the reduction
+                if isinstance(modified[constraint], dict):
+                    modified[constraint]["severity_score"] = new_sev
+                    # Update label to match new severity
+                    if new_sev < 0.7:
+                        modified[constraint]["label"] = "low"
+                    elif new_sev < 1.5:
+                        modified[constraint]["label"] = "moderate"
+                    # else stays "high"
+
+                total_reduced += step
+
+                # Re-run recommendations with relaxed risk_levels
+                new_recs = self.recommender.recommend_batch(
+                    ingredients, modified, budget
+                )
+                projected = self._estimate_kcal(new_recs)
+
+                log.append({
+                    "constraint": constraint,
+                    "old_severity": round(old_sev, 4),
+                    "new_severity": new_sev,
+                    "projected_kcal_after": projected,
+                    "rationale": rationale,
+                })
+
+            if projected >= self.MIN_KCAL_THRESHOLD:
+                break
+
+        # Final assertion: sodium and potassium must be untouched
+        for immutable in self.IMMUTABLE_CONSTRAINTS:
+            if immutable in risk_levels and immutable in modified:
+                orig_sev = self._extract_severity(risk_levels[immutable])
+                new_sev = self._extract_severity(modified[immutable])
+                assert orig_sev == new_sev, (
+                    f"SAFETY VIOLATION: {immutable} severity was modified "
+                    f"from {orig_sev} to {new_sev}"
+                )
+
+        modified["reconciliation_applied"] = True
+        modified["reconciliation_log"] = log
+        return modified
+
+    @staticmethod
+    def _extract_severity(entry, default: float = 1.0) -> float:
+        """Extract severity_score from a risk_levels entry (dict or str)."""
+        if isinstance(entry, dict):
+            return float(entry.get("severity_score", default))
+        _legacy = {"low": 0.2, "moderate": 1.0, "high": 1.8}
+        return _legacy.get(str(entry).lower().strip(), default)
 
 
 # ===============================
@@ -709,6 +1075,20 @@ class PortionRecommender:
         max_g = min(constraints.values())
         max_g = min(max_g, self.config.default_cap_g)  # Apply practical cap
         
+        # ── Phase 1C: Phosphorus-protein efficiency adjustment ──
+        # KDIGO 2024: favour low-phos protein sources for CKD patients
+        phos_efficiency = None
+        if phos_sev > 1.5:
+            phos_efficiency = self.ifct.get_phos_protein_efficiency(
+                ingredient, config=self.config
+            )
+            if phos_efficiency["ckd_preferred"]:
+                max_g *= self.config.phos_efficiency_bonus
+            elif phos_efficiency["efficiency_tier"] == "poor":
+                max_g *= self.config.phos_efficiency_penalty
+            # Re-apply cap after multiplier
+            max_g = min(max_g, self.config.default_cap_g)
+        
         # Determine label
         if max_g <= self.config.avoid_threshold_g:
             label = "Avoid"
@@ -744,6 +1124,19 @@ class PortionRecommender:
             "phosphorus": f"phosphorus restriction ({phos_label}, sev={phos_sev:.2f}) - CKD guideline",
         }
         
+        # Append phosphorus efficiency info if applicable
+        eff_note = ""
+        if phos_efficiency is not None:
+            tier = phos_efficiency["efficiency_tier"]
+            ratio = phos_efficiency["phos_per_g_protein"]
+            eff_note = f" [Phos efficiency: {tier} ({ratio:.1f} mg/g protein)"
+            if phos_efficiency["ckd_preferred"]:
+                eff_note += f", ×{self.config.phos_efficiency_bonus} bonus]"
+            elif tier == "poor":
+                eff_note += f", ×{self.config.phos_efficiency_penalty} penalty]"
+            else:
+                eff_note += "]"
+        
         explanation = (
             f"{label}: max ~{max_g:.0f}g. "
             f"Limited by {risk_explanations[binding]}. "
@@ -751,6 +1144,7 @@ class PortionRecommender:
             f"{load['potassium_mg']:.0f}mg K, "
             f"{load['protein_g']:.1f}g protein, "
             f"{load['carbs_g']:.1f}g carbs."
+            f"{eff_note}"
         )
         
         return PortionDecision(
@@ -926,7 +1320,12 @@ class PortionControlModel:
         # Initialize daily nutrient ledger
         self.ledger = NutrientLedger()
         
-        print("✓ Model2 initialization complete")
+        # Initialize caloric sufficiency validator (Phase 2B)
+        self.caloric_validator = CaloricSufficiencyValidator(
+            self.ifct, self.recommender
+        )
+        
+        print("\u2713 Model2 initialization complete")
         print("="*60 + "\n")
     
     def get_recommendations(
@@ -969,6 +1368,27 @@ class PortionControlModel:
         # Step 3: Get portion recommendations
         recommendations = self.recommender.recommend_batch(ingredients, risk_levels, budget)
         
+        # Step 3B: Caloric sufficiency validation & reconciliation (Phase 2B)
+        validation = self.caloric_validator.validate(recommendations)
+        clinical_warnings: List[Dict[str, Any]] = []
+        
+        if not validation["is_sufficient"]:
+            reconciled = self.caloric_validator.reconcile(
+                validation, risk_levels, budget, ingredients
+            )
+            if reconciled.get("reconciliation_applied"):
+                # Extract reconciliation metadata before passing to recommender
+                reconciliation_log = reconciled.pop("reconciliation_log", [])
+                reconciled.pop("reconciliation_applied", None)
+                
+                # Re-run recommendations with relaxed risk_levels
+                recommendations = self.recommender.recommend_batch(
+                    ingredients, reconciled, budget
+                )
+                risk_levels = reconciled
+                
+                clinical_warnings = reconciliation_log
+        
         # Step 4: Build summary
         allowed = [r.ingredient for r in recommendations if r.label == "Allowed"]
         half_portion = [r.ingredient for r in recommendations if r.label == "Half portion"]
@@ -1003,7 +1423,8 @@ class PortionControlModel:
                 "allowed": allowed,
                 "half_portion": half_portion,
                 "avoid": avoid,
-            }
+            },
+            "clinical_warnings": clinical_warnings,
         }
     
     def confirm_meal(
@@ -1305,6 +1726,150 @@ def main():
           f"protein={summary['consumed_totals']['protein_g']:.1f}g")
     for m in summary["meals"]:
         print(f"    • {m['meal_name']}: {', '.join(m['items'])}")
+    
+    # ==========================================
+    # VALIDATION: Phase 1C — Phosphorus-Protein Efficiency Scoring
+    # ==========================================
+    print("\n" + "="*60)
+    print("VALIDATION: PHOSPHORUS-PROTEIN EFFICIENCY SCORING (1C)")
+    print("="*60)
+    
+    # --- Test 1: Tier assignment ---
+    eff_egg = model.ifct.get_phos_protein_efficiency("Egg white")
+    print(f"\n  Test 1 — Tier assignment:")
+    print(f"    Egg white: ratio={eff_egg['phos_per_g_protein']}, "
+          f"tier={eff_egg['efficiency_tier']}, "
+          f"ckd_preferred={eff_egg['ckd_preferred']}")
+    assert eff_egg["efficiency_tier"] == "excellent", f"Expected excellent, got {eff_egg['efficiency_tier']}"
+    assert eff_egg["ckd_preferred"] is True, "Expected ckd_preferred=True"
+    print("    ✓ Egg white → excellent tier, ckd_preferred=True (CORRECT)")
+    
+    eff_paneer = model.ifct.get_phos_protein_efficiency("Paneer (Cottage cheese)")
+    print(f"    Paneer: ratio={eff_paneer['phos_per_g_protein']}, "
+          f"tier={eff_paneer['efficiency_tier']}, "
+          f"ckd_preferred={eff_paneer['ckd_preferred']}")
+    
+    # --- Test 2: CKD patient portion comparison ---
+    print(f"\n  Test 2 — CKD patient: low-phos vs high-phos protein:")
+    # Use CKD patient (patient B from earlier)
+    ckd_patient = {
+        "age": 65, "sex_male": 1,
+        "has_htn": 1, "has_dm": 1, "has_ckd": 1,
+        "serum_sodium": 137, "serum_potassium": 5.2,
+        "creatinine": 2.8, "egfr": 28, "hba1c": 7.5,
+        "fbs": 140, "sbp": 145, "dbp": 90, "bmi": 27,
+    }
+    risk_ckd = model.model1.predict_risk_levels(ckd_patient)
+    budget_ckd = model.budget_calc.get_daily_budget(
+        has_ckd=True, has_htn=True, has_dm=True
+    )
+    
+    rec_egg = model.recommender.recommend_one("Egg white", risk_ckd, budget_ckd)
+    rec_paneer = model.recommender.recommend_one("Paneer (Cottage cheese)", risk_ckd, budget_ckd)
+    
+    print(f"    Egg white:  max_grams={rec_egg.max_grams}g, label={rec_egg.label}")
+    print(f"    Paneer:     max_grams={rec_paneer.max_grams}g, label={rec_paneer.label}")
+    
+    # Egg white should have larger max_grams due to bonus
+    # (or at least not be penalised like a poor-tier item)
+    diff_1c = rec_egg.max_grams - rec_paneer.max_grams
+    print(f"    Difference: {diff_1c:.1f}g "
+          f"({'Egg white gets more — correct!' if diff_1c > 0 else 'Paneer gets more — check tiers'})")
+    
+    # --- Test 3: Explanation string includes tier ---
+    print(f"\n  Test 3 — Explanation includes efficiency tier:")
+    has_tier = "Phos efficiency:" in rec_egg.explanation
+    print(f"    Egg white explanation has tier: {has_tier}")
+    if has_tier:
+        # Extract the efficiency note
+        idx_start = rec_egg.explanation.index("[Phos efficiency:")
+        print(f"    → {rec_egg.explanation[idx_start:]}")
+    assert has_tier, "Explanation should contain phos efficiency info for CKD patient"
+    print("    ✓ Efficiency tier present in explanation (CORRECT)")
+    
+    # --- Test 4: CKD-friendly proteins list ---
+    print(f"\n  Test 4 — get_ckd_friendly_proteins():")
+    friendly = model.ifct.get_ckd_friendly_proteins()
+    print(f"    Total CKD-friendly proteins: {len(friendly)}")
+    assert len(friendly) > 0, "Expected non-empty list"
+    for item in friendly:
+        print(f"      {item['ingredient']:30s} ratio={item['phos_per_g_protein']:5.1f}  "
+              f"tier={item['efficiency_tier']}")
+    print("    ✓ Non-empty ranked list returned (CORRECT)")
+    
+    # ==========================================
+    # VALIDATION: Phase 2B — CaloricSufficiencyValidator
+    # ==========================================
+    print("\n" + "="*60)
+    print("VALIDATION: CALORIC SUFFICIENCY VALIDATOR (2B)")
+    print("="*60)
+    
+    # --- Test 1: clinical_warnings key present for normal patient ---
+    print("\n  Test 1 — clinical_warnings key present:")
+    model.ledger._reset()
+    normal_result = model.get_recommendations(patient, ingredients)
+    assert "clinical_warnings" in normal_result, "clinical_warnings key missing"
+    has_warnings = len(normal_result["clinical_warnings"]) > 0
+    print(f"    clinical_warnings present: True")
+    print(f"    Warnings triggered: {has_warnings}")
+    if has_warnings:
+        for w in normal_result["clinical_warnings"]:
+            print(f"      Relaxed {w['constraint']}: "
+                  f"sev {w['old_severity']:.2f} → {w['new_severity']:.2f} "
+                  f"(→ {w['projected_kcal_after']:.0f} kcal)")
+            print(f"        Rationale: {w['rationale']}")
+    else:
+        print("    ✓ No reconciliation needed (caloric threshold met)")
+    print("    ✓ clinical_warnings key present in output (CORRECT)")
+    
+    # --- Test 2: Worst-case patient triggers reconciliation ---
+    print("\n  Test 2 — Worst-case patient triggers reconciliation:")
+    worst_patient = {
+        "age": 72, "sex_male": 1,
+        "has_htn": 1, "has_dm": 1, "has_ckd": 1,
+        "serum_sodium": 130, "serum_potassium": 5.8,
+        "creatinine": 4.5, "egfr": 12, "hba1c": 9.5,
+        "fbs": 220, "sbp": 180, "dbp": 110, "bmi": 32,
+    }
+    # Use high-calorie high-potassium ingredients to force restriction
+    worst_ingredients = [
+        "Banana, ripe", "Potato (Aloo)", "Spinach (Palak)",
+        "Coconut, dry", "Rice, milled (white)", "Chicken, breast",
+        "Egg, whole, boiled", "Curd (Dahi/Yogurt)",
+    ]
+    model.ledger._reset()
+    worst_result = model.get_recommendations(worst_patient, worst_ingredients)
+    assert "clinical_warnings" in worst_result
+    worst_warnings = worst_result["clinical_warnings"]
+    print(f"    Warnings triggered: {len(worst_warnings) > 0}")
+    if worst_warnings:
+        print(f"    Reconciliation steps: {len(worst_warnings)}")
+        for w in worst_warnings:
+            print(f"      Relaxed {w['constraint']}: "
+                  f"sev {w['old_severity']:.2f} → {w['new_severity']:.2f} "
+                  f"(→ {w['projected_kcal_after']:.0f} kcal)")
+        print("    ✓ Reconciliation triggered for worst-case patient (CORRECT)")
+    else:
+        print("    ⚠ No reconciliation triggered (caloric threshold may be met "
+              "even under max restrictions)")
+    
+    # --- Test 3: Sodium and potassium are NEVER modified ---
+    print("\n  Test 3 — Sodium/potassium immutability:")
+    risk_worst = model.model1.predict_risk_levels(worst_patient)
+    orig_sod_sev = risk_worst["sodium_sensitivity"]["severity_score"]
+    orig_pot_sev = risk_worst["potassium_sensitivity"]["severity_score"]
+    result_sod_sev = worst_result["risk_levels"]["sodium_sensitivity"]["severity_score"]
+    result_pot_sev = worst_result["risk_levels"]["potassium_sensitivity"]["severity_score"]
+    
+    assert orig_sod_sev == result_sod_sev, (
+        f"Sodium modified: {orig_sod_sev} → {result_sod_sev}"
+    )
+    assert orig_pot_sev == result_pot_sev, (
+        f"Potassium modified: {orig_pot_sev} → {result_pot_sev}"
+    )
+    print(f"    Sodium severity: {orig_sod_sev} → {result_sod_sev} (unchanged)")
+    print(f"    Potassium severity: {orig_pot_sev} → {result_pot_sev} (unchanged)")
+    print("    ✓ Sodium and potassium NEVER modified (CORRECT)")
     
     return model
 
