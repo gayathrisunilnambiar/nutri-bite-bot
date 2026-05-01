@@ -3,6 +3,7 @@ mimic IV/
 *.csv
 *.zip
 *.parquet
+*.pdf
 
 # force-include runtime-required data files (needed for HF Spaces / Render)
 !clinical-models/ifct_database.csv
