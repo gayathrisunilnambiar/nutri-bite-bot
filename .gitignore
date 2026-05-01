@@ -5,12 +5,6 @@ mimic IV/
 *.parquet
 *.pdf
 
-# force-include runtime-required data files (needed for HF Spaces / Render)
-!clinical-models/ifct_database.csv
-!artifacts/models/imputer.joblib
-!artifacts/models/scaler.joblib
-!artifacts/models/feature_names.joblib
-
 # env / caches
 .env
 .venv/
@@ -18,6 +12,13 @@ __pycache__/
 *.joblib
 *.pkl
 *.h5
+
+# force-include runtime-required data files (needed for HF Spaces / Render)
+# these MUST come after the wildcard rules above, or negations are ignored
+!clinical-models/ifct_database.csv
+!artifacts/models/imputer.joblib
+!artifacts/models/scaler.joblib
+!artifacts/models/feature_names.joblib
 
 # tooling
 .claude/
