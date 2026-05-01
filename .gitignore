@@ -4,9 +4,19 @@ mimic IV/
 *.zip
 *.parquet
 
+# force-include runtime-required data files (needed for HF Spaces / Render)
+!clinical-models/ifct_database.csv
+!artifacts/models/imputer.joblib
+!artifacts/models/scaler.joblib
+!artifacts/models/feature_names.joblib
+
 # env / caches
+.env
 .venv/
 __pycache__/
 *.joblib
 *.pkl
 *.h5
+
+# tooling
+.claude/
