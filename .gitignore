@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # datasets
 mimic IV/
 *.csv
@@ -14,3 +15,40 @@ __pycache__/
 
 # tooling
 .claude/
+=======
+# datasets and research documents
+mimic IV/
+*.csv
+*.zip
+*.parquet
+*.pdf
+*.tex
+
+# env / caches
+.env
+.venv/
+__pycache__/
+*.joblib
+*.pkl
+*.h5
+
+# dev-session artifacts (logs, temp outputs, task tracking)
+*.log
+*_status.json
+temp_*.txt
+task.md
+test_output.txt
+test_result.txt
+test_out.log
+db_activity.txt
+
+# force-include runtime-required data files (needed for HF Spaces)
+# MUST come after wildcard rules above — last matching rule wins
+!clinical-models/ifct_database.csv
+!artifacts/models/imputer.joblib
+!artifacts/models/scaler.joblib
+!artifacts/models/feature_names.joblib
+
+# tooling
+.claude/
+>>>>>>> 196878a9a3afb1baa3aa57e1a4a883260ad270e7
