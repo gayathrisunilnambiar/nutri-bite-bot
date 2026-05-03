@@ -16,7 +16,6 @@ import math
 import os
 import base64
 import tempfile
-import zipfile
 import shutil
 import requests as http_requests
 from difflib import get_close_matches
@@ -51,30 +50,13 @@ TARGET_NAMES = [
     "carb_sensitivity",
 ]
 
-# Build a temporary .zip from model_params.json + network.pt for TabNet's load_model()
-def _load_tabnet_from_parts(model_dir):
-    """Load a TabNet model from standalone model_params.json + network.pt files."""
-    params_path = os.path.join(model_dir, "model_params.json")
-    weights_path = os.path.join(model_dir, "network.pt")
-    tmp_zip = os.path.join(model_dir, "_tabnet_tmp.zip")
-    try:
-        with zipfile.ZipFile(tmp_zip, "w") as zf:
-            zf.write(params_path, "model_params.json")
-            zf.write(weights_path, "network.pt")
-        model = TabNetClassifier()
-        model.load_model(tmp_zip)
-        return model
-    finally:
-        if os.path.exists(tmp_zip):
-            os.remove(tmp_zip)
-
-_tabnet_model = _load_tabnet_from_parts(MODEL_DIR)
-print(f"  ✓ TabNet model loaded from model_params.json + network.pt")
-
-# Share the single TabNet model across all 4 risk targets
+# Load each target's dedicated zip (sodium_sensitivity.zip, etc.)
 for target in TARGET_NAMES:
-    MODELS[target] = _tabnet_model
-    print(f"  ✓ {target} → TabNet model")
+    zip_path = os.path.join(MODEL_DIR, f"{target}.zip")
+    model = TabNetClassifier()
+    model.load_model(zip_path)
+    MODELS[target] = model
+    print(f"  ✓ {target} loaded from {target}.zip")
 
 # Load preprocessing artifacts and extract fitted parameters.
 # The imputer/scaler .joblib files may be incompatible with the current
